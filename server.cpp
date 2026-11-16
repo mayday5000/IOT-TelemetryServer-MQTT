@@ -161,15 +161,19 @@ private:
 public:
     AsyncWriteBuffer(int fd, int epoll_fd) : file_descriptor_(fd), epoll_descriptor_(epoll_fd) {}
 
-    void send_payload(const uint8_t* data, size_t length) {
+    // Returns false on a hard socket error (EPIPE, ECONNRESET, ...): caller treats it as a disconnect
+    bool send_payload(const uint8_t* data, size_t length) {
         std::lock_guard<std::mutex> lock(write_mutex_);
 
         if (!outbound_queue_.empty()) {
             outbound_queue_.push(std::vector<uint8_t>(data, data + length));
-            return;
+            return true;
         }
 
-        ssize_t bytes_written = write(file_descriptor_, data, length);
+        ssize_t bytes_written;
+        do { // MSG_NOSIGNAL: a reset peer yields EPIPE instead of a process-killing SIGPIPE
+            bytes_written = send(file_descriptor_, data, length, MSG_NOSIGNAL);
+        } while (bytes_written == -1 && errno == EINTR);
         if (bytes_written >= 0) {
             size_t written = static_cast<size_t>(bytes_written);
             if (written < length) {
@@ -181,33 +185,40 @@ public:
             outbound_queue_.push(std::vector<uint8_t>(data, data + length));
             pending_offset_ = 0;
             update_epoll_mask(true);
+        } else {
+            return false;
         }
+        return true;
     }
 
-    void handle_write_ready() {
+    // Returns false on a hard socket error (EPIPE, ECONNRESET, ...)
+    bool handle_write_ready() {
         std::lock_guard<std::mutex> lock(write_mutex_);
 
         while (!outbound_queue_.empty()) {
             const auto& chunk = outbound_queue_.front();
             size_t bytes_left = chunk.size() - pending_offset_;
 
-            ssize_t bytes_written = write(file_descriptor_, chunk.data() + pending_offset_, bytes_left);
+            ssize_t bytes_written = send(file_descriptor_, chunk.data() + pending_offset_, bytes_left, MSG_NOSIGNAL);
             if (bytes_written >= 0) {
                 size_t written = static_cast<size_t>(bytes_written);
                 if (written < bytes_left) {
                     pending_offset_ += written;
-                    return; 
+                    return true; 
                 } else {
                     outbound_queue_.pop();
                     pending_offset_ = 0;
                 }
+            } else if (errno == EINTR) {
+                continue;
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
+                return true;
             } else {
-                return;
+                return false; // EPIPE / ECONNRESET: peer is gone
             }
         }
         update_epoll_mask(false);
+        return true;
     }
 };
 
@@ -293,6 +304,11 @@ int main() {
     // Install graceful shutdown handlers
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
+
+    // Belt and braces with MSG_NOSIGNAL: writing to a reset peer must never kill the server
+    struct sigaction ignore_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ignore_pipe, nullptr);
 
     auto pipeline = std::make_shared<TelemetryPipeline>();
     ClientRegistry registry;
@@ -400,10 +416,18 @@ int main() {
                 close(current_fd);
             } 
             else {
+                bool write_failed = false;
                 if (events[i].events & EPOLLOUT) {
-                    if (write_managers.count(current_fd)) write_managers[current_fd]->handle_write_ready();
+                    if (write_managers.count(current_fd) && !write_managers[current_fd]->handle_write_ready()) write_failed = true;
                 }
-                if (events[i].events & EPOLLIN) {
+                if (write_failed) {
+                    std::cerr << "[SERVER ENGINE] Write failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
+                    registry.remove_client_by_fd(current_fd);
+                    write_managers.erase(current_fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
+                    close(current_fd);
+                }
+                else if (events[i].events & EPOLLIN) {
                     auto packet = std::make_unique<TelemetryPacket>();
                     bool disconnect = false;
 
@@ -423,7 +447,11 @@ int main() {
                                     
                                     // Securely route an validation acknowledgement response frame out to the client
                                     uint8_t connack[] = {0x20, 0x02, 0x00, 0x00};
-                                    if (write_managers.count(current_fd)) write_managers[current_fd]->send_payload(connack, 4);
+                                    if (write_managers.count(current_fd) && !write_managers[current_fd]->send_payload(connack, 4)) {
+                                        std::cerr << "[SERVER ENGINE] CONNACK send failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
+                                        pipeline->push(std::move(packet)); // CONNECT already read; still hand it to the workers
+                                        disconnect = true; break;
+                                    }
                                 }
                             } else {
                                 packet->validated_device_id = known_id.value();

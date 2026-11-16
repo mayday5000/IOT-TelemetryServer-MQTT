@@ -28,6 +28,7 @@ The companion client builds an MQTT 3.1.1 CONNECT frame (clean session, 60 s kee
 - Bounded Queue (Drop-Oldest): Capped at 10,000 packets; when full, the oldest packet is dropped so memory cannot grow without limit and the reactor never stalls.
 - RAII Memory Scrubbing: The TelemetryPacket destructor zeroes the payload buffer with std::memset whenever a packet is destroyed (processed, dropped on overflow, or unwound by an exception).
 - Modern C++ Primitives: std::jthread worker pool, std::atomic stop flags with explicit memory ordering, std::unique_ptr packet ownership, and a std::expected-based helper (C++23).
+- Reset-Safe Socket Writes: All socket writes use send(..., MSG_NOSIGNAL) and SIGPIPE is ignored at startup, so a peer that resets or closes the connection can never kill the process. EPIPE/ECONNRESET is treated as a normal disconnect: the server drops that client from the registry, closes its fd and keeps serving the others; the client logs the failure and shuts down cleanly.
 - Graceful Shutdown: SIGINT/SIGTERM set an atomic stop flag and ring the shutdown `eventfd`, waking the reactor instantly (no polling delay) from whichever thread received the signal; the server's workers then finish every packet already queued before they are joined, and the client flushes pending telemetry for up to 1 second before closing.
 
 ## System Architecture
@@ -154,16 +155,18 @@ CLIENT ARCHITECTURE:
 
 ```
 send_payload()
-  ├─ Queue empty? ──► Attempt direct write()
+  ├─ Queue empty? ──► Attempt direct send(MSG_NOSIGNAL)
   │     ├─ All bytes written ──► Done
-  │     └─ Partial / EAGAIN  ──► Queue remainder + enable EPOLLOUT
+  │     ├─ Partial / EAGAIN  ──► Queue remainder + enable EPOLLOUT
+  │     └─ EPIPE / ECONNRESET ──► return false ──► caller disconnects
   └─ Queue non-empty ──► Append to queue (preserves FIFO order)
 
 handle_write_ready() [Triggered by EPOLLOUT]
   └─ While queue not empty:
-        write() next chunk from offset
+        send(MSG_NOSIGNAL) next chunk from offset
         ├─ Partial write ──► Update offset, yield (wait for next EPOLLOUT)
-        └─ Full chunk    ──► Pop chunk, continue
+        ├─ Full chunk    ──► Pop chunk, continue
+        └─ EPIPE / ECONNRESET ──► return false ──► caller disconnects
   └─ Queue empty ──► Disable EPOLLOUT (prevents busy-looping)
 ```
 
@@ -320,7 +323,6 @@ tests.cpp is a standalone program with four quick sanity checks: the atomic stop
 | No CONNACK | The first bytes on a new connection must be a CONNECT (0x10) frame of at least 12 bytes; otherwise the data is processed as UNAUTHENTICATED and no CONNACK is sent. |
 | Ctrl-C takes a long time on the server | Workers are draining a large backlog. Each packet already queued is processed before exit. |
 | Fewer [WORKER] lines than messages sent | TCP is a byte stream: several small messages that arrive together are read as one packet (up to 1,024 bytes). There is no per-message framing. |
-| Client killed silently while writing | SIGPIPE is not ignored, so writing to a socket the peer has reset terminates the process. |
 
 ### Scaling & Production Hardening
 
@@ -357,7 +359,6 @@ This is a compact teaching and reference implementation, not a full MQTT broker:
 - No TLS and no authentication: traffic is plain TCP on port 8883, and the client identifier is trusted as-is. Data from connections that never send a valid CONNECT is still queued and processed as UNAUTHENTICATED.
 - No message framing: packets are whatever a single read() returns (up to 1,024 bytes).
 - Client: IPv4 only, port fixed at 8883, blocking connect() at startup, no reconnect logic, simulated constant sensor value.
-- Neither process ignores SIGPIPE.
 - Dropped packets (queue overflow) are not counted or reported, and every processed packet is logged to stdout.
 
 ## License

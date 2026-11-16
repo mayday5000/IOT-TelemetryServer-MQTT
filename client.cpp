@@ -43,6 +43,7 @@ private:
     std::queue<std::vector<uint8_t>> outbound_queue_;
     size_t pending_offset_ = 0;
     std::mutex write_mutex_;
+    std::atomic<bool> broken_{false}; // Set once a send fails hard (EPIPE, ECONNRESET, ...)
 
     void update_epoll_mask(bool enable_write) {
         epoll_event ev{};
@@ -55,6 +56,8 @@ private:
     }
 
 public:
+    bool is_broken() const { return broken_.load(std::memory_order_relaxed); }
+
     bool has_pending() {
         std::lock_guard<std::mutex> lock(write_mutex_);
         return !outbound_queue_.empty();
@@ -63,15 +66,20 @@ public:
     ClientWritePipeline(int socket_fd, int epoll_fd) 
         : socket_fd_(socket_fd), epoll_fd_(epoll_fd) {}
 
-    void send_payload(const uint8_t* data, size_t length) {
+    // Returns false on a hard socket error (EPIPE, ECONNRESET, ...): the connection is gone
+    bool send_payload(const uint8_t* data, size_t length) {
         std::lock_guard<std::mutex> lock(write_mutex_);
+        if (broken_.load(std::memory_order_relaxed)) return false;
 
         if (!outbound_queue_.empty()) {
             outbound_queue_.push(std::vector<uint8_t>(data, data + length));
-            return;
+            return true;
         }
 
-        ssize_t bytes_written = write(socket_fd_, data, length);
+        ssize_t bytes_written;
+        do { // MSG_NOSIGNAL: a reset peer yields EPIPE instead of a process-killing SIGPIPE
+            bytes_written = send(socket_fd_, data, length, MSG_NOSIGNAL);
+        } while (bytes_written == -1 && errno == EINTR);
 
         if (bytes_written >= 0) {
             size_t written = static_cast<size_t>(bytes_written);
@@ -86,34 +94,43 @@ public:
                 outbound_queue_.push(std::vector<uint8_t>(data, data + length));
                 pending_offset_ = 0;
                 update_epoll_mask(true);
+            } else {
+                broken_.store(true, std::memory_order_relaxed);
+                return false;
             }
         }
+        return true;
     }
 
-    void handle_write_ready() {
+    // Returns false on a hard socket error (EPIPE, ECONNRESET, ...)
+    bool handle_write_ready() {
         std::lock_guard<std::mutex> lock(write_mutex_);
+        if (broken_.load(std::memory_order_relaxed)) return false;
 
         while (!outbound_queue_.empty()) {
             const auto& current_chunk = outbound_queue_.front();
             size_t bytes_left = current_chunk.size() - pending_offset_;
 
-            ssize_t bytes_written = write(socket_fd_, current_chunk.data() + pending_offset_, bytes_left);
+            ssize_t bytes_written = send(socket_fd_, current_chunk.data() + pending_offset_, bytes_left, MSG_NOSIGNAL);
 
             if (bytes_written >= 0) {
                 size_t written = static_cast<size_t>(bytes_written);
                 if (written < bytes_left) {
                     pending_offset_ += written;
-                    return; 
+                    return true; 
                 } else {
                     outbound_queue_.pop();
                     pending_offset_ = 0;
                 }
             } else {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-                return;
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+                broken_.store(true, std::memory_order_relaxed); // EPIPE / ECONNRESET: peer is gone
+                return false;
             }
         }
         update_epoll_mask(false); // Queue dry. Stop spinning.
+        return true;
     }
 };
 
@@ -208,6 +225,11 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // Belt and braces with MSG_NOSIGNAL: writing to a reset server must never kill the client
+    struct sigaction ignore_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ignore_pipe, nullptr);
+
     // Allocate connection socket
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd == -1) {
@@ -268,7 +290,13 @@ int main(int argc, char* argv[]) {
     std::thread telemetry_worker([pipeline, connect_packet, device_name, &sleep_mutex, &sleep_cv]() {
         // Step A: Send MQTT CONNECT
         std::cout << "[TELEMETRY] Sending CONNECT for device: " << device_name << "\n";
-        pipeline->send_payload(connect_packet.data(), connect_packet.size());
+        if (!pipeline->send_payload(connect_packet.data(), connect_packet.size())) {
+            std::cerr << "[TELEMETRY] CONNECT send failed (connection reset). Stopping.\n";
+            g_client_active.store(false, std::memory_order_relaxed);
+            uint64_t one = 1;
+            (void)!write(g_wake_fd, &one, sizeof(one)); // Wake the reactor so it shuts down
+            return;
+        }
 
         uint32_t message_counter = 0;
 
@@ -283,7 +311,13 @@ int main(int argc, char* argv[]) {
             std::string metric = "{\"msg_idx\":" + std::to_string(message_counter++) + ",\"temp_c\":24.85}";
             
             // Raw inline transfer to background writer pipeline
-            pipeline->send_payload(reinterpret_cast<const uint8_t*>(metric.data()), metric.length());
+            if (!pipeline->send_payload(reinterpret_cast<const uint8_t*>(metric.data()), metric.length())) {
+                std::cerr << "[TELEMETRY] Send failed (connection reset). Stopping.\n";
+                g_client_active.store(false, std::memory_order_relaxed);
+                uint64_t one = 1;
+                (void)!write(g_wake_fd, &one, sizeof(one)); // Wake the reactor so it shuts down
+                break;
+            }
         }
         std::cout << "[TELEMETRY] Background worker detached cleanly.\n";
     });
@@ -317,7 +351,12 @@ int main(int argc, char* argv[]) {
                 break;
             }
             if (events[i].events & EPOLLOUT) {
-                pipeline->handle_write_ready();
+                if (!pipeline->handle_write_ready()) {
+                    std::cerr << "[CLIENT] Write failed (connection reset by peer).\n";
+                    peer_closed = true;
+                    g_client_active.store(false, std::memory_order_relaxed);
+                    break;
+                }
             }
             if (events[i].events & EPOLLIN) {
                 uint8_t buf[256];
@@ -342,6 +381,7 @@ int main(int argc, char* argv[]) {
     }
     sleep_cv.notify_all(); // Wake the telemetry thread from its 2 s sleep
     if (telemetry_worker.joinable()) telemetry_worker.join();
+    if (pipeline->is_broken()) peer_closed = true; // A failed send means the server is gone
 
     // Bounded flush: give queued telemetry up to FLUSH_TIMEOUT_MS to reach the server.
     // Skipped if the peer is gone; a second Ctrl-C (eventfd) aborts it.
@@ -362,7 +402,7 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < n; ++i) {
                 if (events[i].data.fd == g_wake_fd ||
                     (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))) { abort_flush = true; break; }
-                if (events[i].events & EPOLLOUT) pipeline->handle_write_ready();
+                if ((events[i].events & EPOLLOUT) && !pipeline->handle_write_ready()) { abort_flush = true; break; }
             }
         }
         if (pipeline->has_pending()) std::cerr << "[CLIENT] Unsent telemetry discarded at shutdown.\n";
