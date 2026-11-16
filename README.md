@@ -1,7 +1,5 @@
 # IoT Telemetry Server (MQTT)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 A high-performance, low-power MQTT telemetry server and client written in modern C++23 for Linux IoT edge environments.
 
 Built on a non-blocking, edge-triggered epoll reactor architecture, the server accepts concurrent TCP connections, validates binary MQTT CONNECT frames, maps devices via an O(1) bidirectional registry, issues CONNACK responses, and offloads payload processing to a static worker thread pool. Outbound traffic is throttled through an asynchronous write pipeline so slow cellular or Wi-Fi clients never block the main network thread.
@@ -22,6 +20,39 @@ The companion client builds a proper MQTT CONNECT frame, sends it, then periodic
 - Graceful Shutdown: Signal-driven (SIGINT/SIGTERM) atomic teardown drains queues and joins all worker threads cleanly.
 
 ## System Architecture
+
+### Control Flow Overview
+
+```
+Bootstrap (main thread)
+  install signal handlers
+  spawn jthread worker pool
+        │
+        ▼
+Reactor loop (main thread)
+  while (g_running)
+    epoll_wait(500 ms)
+    for each ready event
+      ├─ listen fd  → drain accept until EAGAIN
+      ├─ EPOLLIN    → drain read until EAGAIN
+      │                 parse CONNECT if new, else tag + push
+      ├─ EPOLLOUT   → handle_write_ready
+      └─ hang-up    → registry remove + close
+        │
+        ▼
+Workers (background)
+  while (g_running)
+    packet = pipeline->pop()   // blocks on condition variable
+    if (!packet) break
+    process and scrub
+        │
+        ▼
+Shutdown
+  signal sets g_running = false
+  pipeline->shutdown() + notify_all()
+  jthread destructors join workers
+  close listening socket and epoll fd
+```
 
 ### 1. Reactor & Worker Pool Model
 
@@ -271,6 +302,6 @@ The worker count is computed as twice the hardware concurrency reported by the s
 
 SafeMqttParser performs bounds-checked remaining-length decoding before extracting the client-identifier string, so a malformed CONNECT cannot overrun the receive buffer. The fixed CONNACK indicates connection success and is sufficient for the teaching client.
 
-## License
+**License**
 
-This project is licensed under the [MIT License](LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.
+This project is licensed under the [<u>MIT License</u>](https://github.com/mayday5000/IOT-TelemetryServer-MQTT/blob/main/LICENSE). Copyright (c) 2026 Damian Andres Ulanowicz.

@@ -30,7 +30,7 @@
 #include <expected>
 
 // ============================================================================
-// 🔒 1. DATA INFRASTRUCTURE & RAII HARDWARE CONFIGURATION
+// Data structures and RAII packet scrubbing
 // ============================================================================
 constexpr size_t MAX_PACKET_SIZE     = 1024; // Expanded for MQTT bursts
 constexpr size_t MAX_EVENTS          = 64;
@@ -57,7 +57,7 @@ struct LargeHeapWorkspace {
 };
 
 // ============================================================================
-// 🎨 2. SAFE MULTI-INDEX AUTHENTICATED CLIENT REGISTRY
+// Bidirectional client registry
 // ============================================================================
 struct ConnectedClient {
     std::string device_id;
@@ -106,7 +106,7 @@ public:
 };
 
 // ============================================================================
-// 📦 3. ZERO-ALLOCATION MQTT CONNECT PACKET PARSER
+// Bounds-checked MQTT CONNECT parser
 // ============================================================================
 class SafeMqttParser {
 public:
@@ -138,7 +138,7 @@ public:
 };
 
 // ============================================================================
-// 🌊 4. EDGE-TRIGGERED (`EPOLLET`) NON-BLOCKING OUTBOUND STREAM QUEUE
+// Non-blocking outbound write queue
 // ============================================================================
 class AsyncWriteBuffer {
 private:
@@ -210,7 +210,7 @@ public:
 };
 
 // ============================================================================
-// 🚀 5. PROCESSING PIPELINE STAGE (DECOUPLED THREAD WORK QUEUE)
+// Thread-safe work queue
 // ============================================================================
 class TelemetryPipeline {
 private:
@@ -244,7 +244,7 @@ public:
 };
 
 // ============================================================================
-// 🏛️ 6. SYSTEM RUNTIME ROUTING
+// Runtime helpers and main
 // ============================================================================
 bool make_socket_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -325,7 +325,7 @@ int main() {
     std::cout << "[SERVER ENGINE] Monitoring port " << SERVER_PORT << " with Edge-Triggered Linux Epoll.\n";
 
     // ============================================================================
-    // ⚡ REACTOR MASTER EVENT LOOP
+    // Reactor event loop
     // ============================================================================
     while (g_running.load(std::memory_order_relaxed)) {
         int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, 500); // 500 ms timeout so flag is observed
@@ -420,74 +420,3 @@ int main() {
     close(epoll_fd);
     return 0;
 }
-
-
-/*
-
-========================================================================================================
-[ PHASE 1: BOOTSTRAP INITIALIZATION ]
-========================================================================================================
- │
- ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  LOOP 1: for (unsigned int i = 0; i < pool_size; ++i)                                                │
-│  • Running In: Main Thread                                                                           │
-│  • Exit Condition: When counter 'i' reaches 'pool_size'                                              │
-│  • Purpose: Spawns background workers, shrinks stacks to 64KB, pushes threads into vector tracker.   │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
- │
- ├─────────────────────────────────────────┐
- ▼                                         ▼
-=======================================   ==============================================================
-[ WORKER THREAD POOL ]                    [ PHASE 2: EVENT DISPATCHER (REACTOR) ]
-=======================================   ==============================================================
- │                                         │
- ▼                                         ▼
-┌─────────────────────────────────────┐   ┌────────────────────────────────────────────────────────────┐
-│ LOOP 2: while (running)             │   │ LOOP 3: while (running)                                    │
-│ • Running In: BACKGROUND THREADS    │   │ • Running In: MAIN THREAD                                  │
-│ • Exit Condition: running == false  │   │ • Exit Condition: running == false                         │
-│ • Purpose: Blocks on pipeline CV.   │   │ • Purpose: Sleeps 0% CPU in epoll_wait() until network     │
-│   Pops and processes payloads.      │   │   hardware interrupts fire.                                │
-└─────────────────────────────────────┘   └────────────────────────────────────────────────────────────┘
-                                           │
-                                           ▼
-                                          ┌────────────────────────────────────────────────────────────┐
-                                          │ LOOP 4: for (int i = 0; i < num_events; ++i)               │
-                                          │ • Running In: MAIN THREAD                                  │
-                                          │ • Exit Condition: i reaches number of active events        │
-                                          │ • Purpose: Iterates strictly through active network        │
-                                          │   file descriptors that generated traffic.                 │
-                                          └────────────────────────────────────────────────────────────┘
-                                           │
-                                           ├───────────────────────────┐
-                                           │ (If New Connection)       │ (If Data Inbound)
-                                           ▼                           ▼
-                                          ┌────────────────────────┐  ┌────────────────────────────────┐
-                                          │ LOOP 5: while (true)   │  │ LOOP 6: while (true)           │
-                                          │ • Running In: MAIN THTR│  │ • Running In: MAIN THREAD      │
-                                          │ • Exit Condition:      │  │ • Exit Condition:              │
-                                          │   accept() returns     │  │   read() returns EAGAIN/0/-1   │
-                                          │   EAGAIN/EWOULDBLOCK   │  │ • Purpose: Edge-triggered drain│
-                                          │ • Purpose: Edge-       │  │   of all telemetry bytes from  │
-                                          │   triggered accept of  │  │   the socket into a packet.    │
-                                          │   all clients at gate. │  └────────────────────────────────┘
-                                          └────────────────────────┘   │
-                                                                       │ (packet pushed to pipeline)
-                                                                       └───────────┐
-                                                                                   ▼
-                                                                      [ Wakes up Waiting Loop 2 ]
-
-========================================================================================================
-[ PHASE 3: SHUTDOWN DESTRUCTION ]
-========================================================================================================
- │
- ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  LOOP 7: for (auto& t : workers)                                                                     │
-│  • Running In: Main Thread                                                                           │
-│  • Exit Condition: When every thread object in the vector tracker has been evaluated                 │
-│  • Purpose: Calls .join() on all workers. Blocks Main until background threads finish up completely. │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-*/
