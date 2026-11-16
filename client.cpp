@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <chrono>
 #include <csignal>
+#include <cerrno>
 #include <expected>
 #include <span>
 
@@ -22,6 +23,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -173,14 +175,28 @@ bool make_socket_non_blocking(int fd) {
 // Global stop flag reachable by signal handler
 std::atomic<bool> g_client_active{true};
 
+// Shutdown "doorbell": eventfd watched by epoll so the reactor can sleep with no timeout
+int g_wake_fd = -1;
+
 void signal_handler(int) {
+    int saved_errno = errno;
     g_client_active.store(false, std::memory_order_relaxed);
+    uint64_t one = 1;
+    if (g_wake_fd != -1) (void)!write(g_wake_fd, &one, sizeof(one)); // async-signal-safe wake
+    errno = saved_errno;
 }
 
 int main(int argc, char* argv[]) {
     std::string device_name = (argc > 1) ? argv[1] : "IoT_Edge_Node_01";
     std::string server_ip   = (argc > 2) ? argv[2] : "127.0.0.1";
     int server_port         = 8883;
+
+    // Create the shutdown eventfd before handlers can fire
+    g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_wake_fd == -1) {
+        std::cerr << "[CRITICAL] eventfd creation failed.\n";
+        return 1;
+    }
 
     // Install graceful shutdown handlers
     std::signal(SIGINT,  signal_handler);
@@ -225,15 +241,25 @@ int main(int argc, char* argv[]) {
     ev.data.fd = sock_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_fd, &ev);
 
+    // Register the shutdown eventfd so a signal wakes the reactor instantly
+    epoll_event wake_ev{};
+    wake_ev.events = EPOLLIN;
+    wake_ev.data.fd = g_wake_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_wake_fd, &wake_ev);
+
     auto pipeline = std::make_shared<ClientWritePipeline>(sock_fd, epoll_fd);
 
     // Build CONNECT frame once
     auto connect_packet = MqttPacketFactory::create_connect_frame(device_name);
 
+    // Lets the reactor interrupt the telemetry thread's 2 s sleep on shutdown
+    std::mutex sleep_mutex;
+    std::condition_variable sleep_cv;
+
     // ============================================================================
     // 🔒 4. DECOUPLED TELEMETRY HARNESS LOOP (LOW-POWER BACKGROUND THREAD)
     // ============================================================================
-    std::thread telemetry_worker([pipeline, connect_packet, device_name]() {
+    std::thread telemetry_worker([pipeline, connect_packet, device_name, &sleep_mutex, &sleep_cv]() {
         // Step A: Send MQTT CONNECT
         std::cout << "[TELEMETRY] Sending CONNECT for device: " << device_name << "\n";
         pipeline->send_payload(connect_packet.data(), connect_packet.size());
@@ -242,8 +268,11 @@ int main(int argc, char* argv[]) {
 
         // Step B: Loop simulation representing ongoing low-overhead physical telemetry streams
         while (g_client_active.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::seconds(2)); // Read physical sensors every 2 seconds
-            if (!g_client_active.load(std::memory_order_relaxed)) break;
+            // Read physical sensors every 2 seconds; sleep, but wake at once on shutdown
+            std::unique_lock<std::mutex> lock(sleep_mutex);
+            if (sleep_cv.wait_for(lock, std::chrono::seconds(2),
+                    [] { return !g_client_active.load(std::memory_order_relaxed); })) break;
+            lock.unlock();
 
             std::string metric = "{\"msg_idx\":" + std::to_string(message_counter++) + ",\"temp_c\":24.85}";
             
@@ -260,14 +289,20 @@ int main(int argc, char* argv[]) {
     std::cout << "[REACTOR] Client network loop activated safely.\n";
 
     while (g_client_active.load(std::memory_order_relaxed)) {
-        // Finite timeout so the stop flag is observed
-        int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, 500);
+        // Sleep until socket I/O or the shutdown eventfd wakes us
+        int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1);
         if (num_events == -1) {
             if (errno == EINTR) continue;
             break;
         }
 
         for (int i = 0; i < num_events; ++i) {
+            if (events[i].data.fd == g_wake_fd) {
+                uint64_t counter = 0;
+                (void)!read(g_wake_fd, &counter, sizeof(counter)); // Drain the doorbell
+                g_client_active.store(false, std::memory_order_relaxed);
+                break;
+            }
             if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                 std::cerr << "[CLIENT] Connection closed by peer or error.\n";
                 g_client_active.store(false, std::memory_order_relaxed);
@@ -292,10 +327,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    g_client_active.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(sleep_mutex);
+        g_client_active.store(false, std::memory_order_relaxed);
+    }
+    sleep_cv.notify_all(); // Wake the telemetry thread from its 2 s sleep
     if (telemetry_worker.joinable()) telemetry_worker.join();
     close(sock_fd);
     close(epoll_fd);
+    close(g_wake_fd);
     std::cout << "[CLIENT] Shutdown complete.\n";
     return 0;
 }

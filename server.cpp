@@ -21,11 +21,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <csignal>
+#include <cerrno>
 #include <span>
 #include <expected>
 
@@ -260,11 +262,25 @@ std::expected<void, std::string> ensure_non_blocking(int fd) {
 // Global stop flag reachable by signal handler
 std::atomic<bool> g_running{true};
 
+// Shutdown "doorbell": eventfd watched by epoll so the reactor can sleep with no timeout
+int g_wake_fd = -1;
+
 void signal_handler(int) {
+    int saved_errno = errno;
     g_running.store(false, std::memory_order_relaxed);
+    uint64_t one = 1;
+    if (g_wake_fd != -1) (void)!write(g_wake_fd, &one, sizeof(one)); // async-signal-safe wake
+    errno = saved_errno;
 }
 
 int main() {
+    // Create the shutdown eventfd before handlers can fire
+    g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_wake_fd == -1) {
+        std::cerr << "[CRITICAL] eventfd creation failed.\n";
+        return 1;
+    }
+
     // Install graceful shutdown handlers
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -321,6 +337,12 @@ int main() {
     ev.data.fd = server_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
+    // Register the shutdown eventfd so a signal wakes the reactor instantly
+    epoll_event wake_ev{};
+    wake_ev.events = EPOLLIN;
+    wake_ev.data.fd = g_wake_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_wake_fd, &wake_ev);
+
     std::vector<epoll_event> events(MAX_EVENTS);
     std::cout << "[SERVER ENGINE] Monitoring port " << SERVER_PORT << " with Edge-Triggered Linux Epoll.\n";
 
@@ -328,7 +350,7 @@ int main() {
     // Reactor event loop
     // ============================================================================
     while (g_running.load(std::memory_order_relaxed)) {
-        int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, 500); // 500 ms timeout so flag is observed
+        int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1); // Sleep until I/O or shutdown eventfd
         if (num_events == -1) {
             if (errno == EINTR) continue;
             break;
@@ -336,6 +358,13 @@ int main() {
 
         for (int i = 0; i < num_events; ++i) {
             int current_fd = events[i].data.fd;
+
+            if (current_fd == g_wake_fd) {
+                uint64_t counter = 0;
+                (void)!read(g_wake_fd, &counter, sizeof(counter)); // Drain the doorbell
+                g_running.store(false, std::memory_order_relaxed);
+                break;
+            }
 
             if (current_fd == server_fd) {
                 while (true) { // Edge-Triggered loop: Drain all accept calls
@@ -413,10 +442,13 @@ int main() {
         }
     }
 
+    std::cout << "[SERVER ENGINE] Shutdown requested. Draining workers...\n";
     g_running.store(false, std::memory_order_relaxed);
     pipeline->shutdown();
-    // jthreads join automatically
+    workers.clear(); // jthreads join here
     close(server_fd);
     close(epoll_fd);
+    close(g_wake_fd);
+    std::cout << "[SERVER ENGINE] Shutdown complete.\n";
     return 0;
 }
