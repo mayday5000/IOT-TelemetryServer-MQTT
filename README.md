@@ -51,7 +51,7 @@ Reactor loop (main thread)
       ├─ EPOLLIN    → drain read until EAGAIN
       │                 parse CONNECT if new, else tag + push
       ├─ EPOLLOUT   → handle_write_ready
-      └─ hang-up    → registry remove + close
+      └─ hang-up    → drain remaining reads first, then registry remove + close
         │
         ▼
 Workers (background)
@@ -107,9 +107,9 @@ The reactor never blocks on application work; all CPU-heavy or blocking operatio
      ┌───────────┼───────────┐             │
      ▼           ▼           ▼             │
   accept      EPOLLIN     hang-up          │
-  (drain)     (drain      (DEL + close)    │
-              read +                       │
-              MQTT parse,                  │
+  (drain)     (drain      (drain read,     │
+              read +       then DEL +      │
+              MQTT parse,  close)          │
               push)                        │
                  │                         │
                  └─────────────────────────┘
@@ -120,9 +120,9 @@ The reactor never blocks on application work; all CPU-heavy or blocking operatio
 3. Dispatch:
    - Shutdown eventfd Ready: Read (drain) the eventfd counter and leave the loop.
    - Listening Socket Ready: Drain accept() in a while (true) loop until EAGAIN. Configure each accepted client socket as non-blocking, register it with EPOLLIN | EPOLLET | EPOLLRDHUP, and create an AsyncWriteBuffer.
-   - Socket Error / Hang-Up: Remove the descriptor from the registry and from epoll (EPOLL_CTL_DEL), then close it immediately.
    - Socket Readable (EPOLLIN): Drain read() completely until EAGAIN; each read() of up to 1,024 bytes becomes one TelemetryPacket. If the fd is unregistered, attempt to parse an MQTT CONNECT; on success register the device id and queue a CONNACK (0x20 0x02 0x00 0x00). Otherwise tag the packet with the known device id. Every packet is then pushed to TelemetryPipeline (packets from a connection that never sent a valid CONNECT are processed as UNAUTHENTICATED).
-   - Socket Writable (EPOLLOUT): Call handle_write_ready() to flush the outbound queue.
+   - Socket Error / Hang-Up (EPOLLERR, EPOLLHUP, EPOLLRDHUP): These often arrive together with EPOLLIN when a device sends its last data and closes, so the socket is always drained first and that data is processed normally. Then the descriptor is removed from the registry and from epoll (EPOLL_CTL_DEL) and closed.
+   - Socket Writable (EPOLLOUT): If the connection is still open after reading, call handle_write_ready() to flush the outbound queue.
 4. Loop: Return to epoll_wait().
 
 ### 3. Producer-Consumer Pipeline & Client Architecture

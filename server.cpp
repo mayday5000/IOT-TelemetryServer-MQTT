@@ -409,27 +409,15 @@ int main() {
                     }
                 }
             } 
-            else if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                registry.remove_client_by_fd(current_fd);
-                write_managers.erase(current_fd);
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
-                close(current_fd);
-            } 
             else {
-                bool write_failed = false;
-                if (events[i].events & EPOLLOUT) {
-                    if (write_managers.count(current_fd) && !write_managers[current_fd]->handle_write_ready()) write_failed = true;
-                }
-                if (write_failed) {
-                    std::cerr << "[SERVER ENGINE] Write failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
-                    registry.remove_client_by_fd(current_fd);
-                    write_managers.erase(current_fd);
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
-                    close(current_fd);
-                }
-                else if (events[i].events & EPOLLIN) {
+                // Read first: a peer that sends data and then closes delivers EPOLLIN together with
+                // EPOLLRDHUP/EPOLLHUP, and that final data must be drained before the socket is closed.
+                const uint32_t revents = events[i].events;
+                const bool hangup = revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+                bool disconnect = false;
+
+                if (revents & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                     auto packet = std::make_unique<TelemetryPacket>();
-                    bool disconnect = false;
 
                     while (true) { // Edge-Triggered loop: Drain read socket completely
                         ssize_t bytes_read = read(current_fd, packet->raw_payload, MAX_PACKET_SIZE);
@@ -444,7 +432,7 @@ int main() {
                                 if (parsed_id.has_value()) {
                                     registry.register_client(parsed_id.value(), current_fd);
                                     packet->validated_device_id = parsed_id.value();
-                                    
+                                
                                     // Securely route an validation acknowledgement response frame out to the client
                                     uint8_t connack[] = {0x20, 0x02, 0x00, 0x00};
                                     if (write_managers.count(current_fd) && !write_managers[current_fd]->send_payload(connack, 4)) {
@@ -466,13 +454,22 @@ int main() {
                             disconnect = true; break;
                         }
                     }
+                }
 
-                    if (disconnect) {
-                        registry.remove_client_by_fd(current_fd);
-                        write_managers.erase(current_fd);
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
-                        close(current_fd);
+                if (hangup) disconnect = true; // Peer closed or socket error: everything readable is drained
+
+                if (!disconnect && (revents & EPOLLOUT)) {
+                    if (write_managers.count(current_fd) && !write_managers[current_fd]->handle_write_ready()) {
+                        std::cerr << "[SERVER ENGINE] Write failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
+                        disconnect = true;
                     }
+                }
+
+                if (disconnect) {
+                    registry.remove_client_by_fd(current_fd);
+                    write_managers.erase(current_fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
+                    close(current_fd);
                 }
             }
         }
