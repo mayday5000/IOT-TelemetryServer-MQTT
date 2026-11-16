@@ -31,6 +31,7 @@
 
 constexpr size_t MAX_EVENTS        = 8;
 constexpr size_t TARGET_STACK_SIZE = 64 * 1024; // Low-power 64 KB thread micro-stack
+constexpr int    FLUSH_TIMEOUT_MS  = 1000;      // Max time to flush pending writes on shutdown
 
 // ============================================================================
 // 🌊 1. EDGE-TRIGGERED NON-BLOCKING ASYNC WRITE PIPELINE
@@ -54,6 +55,11 @@ private:
     }
 
 public:
+    bool has_pending() {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return !outbound_queue_.empty();
+    }
+
     ClientWritePipeline(int socket_fd, int epoll_fd) 
         : socket_fd_(socket_fd), epoll_fd_(epoll_fd) {}
 
@@ -287,6 +293,7 @@ int main(int argc, char* argv[]) {
     // ============================================================================
     std::vector<epoll_event> events(MAX_EVENTS);
     std::cout << "[REACTOR] Client network loop activated safely.\n";
+    bool peer_closed = false;
 
     while (g_client_active.load(std::memory_order_relaxed)) {
         // Sleep until socket I/O or the shutdown eventfd wakes us
@@ -305,6 +312,7 @@ int main(int argc, char* argv[]) {
             }
             if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                 std::cerr << "[CLIENT] Connection closed by peer or error.\n";
+                peer_closed = true;
                 g_client_active.store(false, std::memory_order_relaxed);
                 break;
             }
@@ -320,6 +328,7 @@ int main(int argc, char* argv[]) {
                 }
                 if (n == 0) {
                     std::cerr << "[CLIENT] Peer closed connection.\n";
+                    peer_closed = true;
                     g_client_active.store(false, std::memory_order_relaxed);
                     break;
                 }
@@ -333,6 +342,32 @@ int main(int argc, char* argv[]) {
     }
     sleep_cv.notify_all(); // Wake the telemetry thread from its 2 s sleep
     if (telemetry_worker.joinable()) telemetry_worker.join();
+
+    // Bounded flush: give queued telemetry up to FLUSH_TIMEOUT_MS to reach the server.
+    // Skipped if the peer is gone; a second Ctrl-C (eventfd) aborts it.
+    if (!peer_closed && pipeline->has_pending()) {
+        std::cout << "[CLIENT] Flushing pending telemetry before exit...\n";
+        uint64_t counter = 0;
+        (void)!read(g_wake_fd, &counter, sizeof(counter)); // Clear the first Ctrl-C (loop may have exited via EINTR)
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(FLUSH_TIMEOUT_MS);
+        bool abort_flush = false;
+        while (!abort_flush && pipeline->has_pending()) {
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0) break;
+            int n = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, static_cast<int>(left));
+            if (n == -1) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            for (int i = 0; i < n; ++i) {
+                if (events[i].data.fd == g_wake_fd ||
+                    (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))) { abort_flush = true; break; }
+                if (events[i].events & EPOLLOUT) pipeline->handle_write_ready();
+            }
+        }
+        if (pipeline->has_pending()) std::cerr << "[CLIENT] Unsent telemetry discarded at shutdown.\n";
+    }
+
     close(sock_fd);
     close(epoll_fd);
     close(g_wake_fd);

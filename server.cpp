@@ -229,19 +229,28 @@ public:
         cv_.notify_one(); 
     }
 
+    // Returns queued packets until the queue is empty; nullptr only once shutdown
+    // was requested AND every queued packet has been handed out (drain on exit).
     std::unique_ptr<TelemetryPacket> pop() {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this]() { return !queue_.empty() || stop_requested_; });
-        if (stop_requested_ && queue_.empty()) return nullptr;
+        if (queue_.empty()) return nullptr;
 
         auto packet = std::move(queue_.front());
         queue_.pop();
         return packet;
     }
 
-    void shutdown() {
-        stop_requested_ = true;
+    // Returns how many packets were still queued; workers drain them before exiting
+    size_t shutdown() {
+        size_t pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex_); // Set under the lock so no worker misses the wake-up
+            stop_requested_ = true;
+            pending = queue_.size();
+        }
         cv_.notify_all();
+        return pending;
     }
 };
 
@@ -297,10 +306,8 @@ int main() {
     std::vector<std::jthread> workers;
     for (unsigned int i = 0; i < pool_size; ++i) {
         std::jthread w([pipeline]() {
-            while (g_running.load(std::memory_order_relaxed)) {
-                auto packet = pipeline->pop();
-                if (!packet) break;
-
+            // Keep consuming until shutdown is requested and the queue is fully drained
+            while (auto packet = pipeline->pop()) {
                 // Allocate workspace securely onto Heap inside the modern micro-stack framework
                 auto workspace = std::make_unique<LargeHeapWorkspace>();
                 
@@ -328,6 +335,7 @@ int main() {
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0 || listen(server_fd, SOMAXCONN) < 0 || !make_socket_non_blocking(server_fd)) {
         std::cerr << "[CRITICAL] Infrastructure initialization sequence failed.\n";
+        pipeline->shutdown(); // Release workers so their jthreads can join
         return 1;
     }
 
@@ -442,10 +450,11 @@ int main() {
         }
     }
 
-    std::cout << "[SERVER ENGINE] Shutdown requested. Draining workers...\n";
+    // Reactor has stopped reading; let workers finish everything already queued
     g_running.store(false, std::memory_order_relaxed);
-    pipeline->shutdown();
-    workers.clear(); // jthreads join here
+    size_t pending = pipeline->shutdown();
+    std::cout << "[SERVER ENGINE] Shutdown requested. Draining " << pending << " queued packet(s)...\n";
+    workers.clear(); // jthreads join here once the queue is empty
     close(server_fd);
     close(epoll_fd);
     close(g_wake_fd);
