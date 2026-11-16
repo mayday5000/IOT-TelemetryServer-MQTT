@@ -20,7 +20,7 @@ The companion client builds an MQTT 3.1.1 CONNECT frame (clean session, 60 s kee
 - Bounded Memory Footprint: Fixed-size 1 KB packet buffers and a queue capped at 10,000 packets (roughly 10 MB of payload at most) keep RAM usage predictable on constrained edge hardware.
 - Low-Duty-Cycle Client: The client sends small JSON payloads every 2 seconds and sleeps in between; its sleep is interruptible, so Ctrl-C stops it immediately.
 - Edge-Triggered epoll Reactor: Single-threaded I/O multiplexing with EPOLLET and EPOLLRDHUP.
-- Non-Blocking Accept & Read Loops: Exhaustive EAGAIN drain loops ensure the reactor never stalls on slow connections.
+- Non-Blocking Accept & Read Loops: Exhaustive EAGAIN drain loops ensure the reactor never stalls on slow connections. accept() also retries EINTR/ECONNABORTED and handles descriptor exhaustion (EMFILE/ENFILE) with a spare descriptor, so the edge-triggered listener never stalls or spins.
 - Bounds-Checked MQTT CONNECT Parsing: SafeMqttParser checks the CONNECT packet type, decodes the remaining length with an overflow guard, and extracts the client identifier without reading past the receive buffer; the reactor then queues a CONNACK.
 - Bidirectional Client Registry: Dual std::unordered_map indexing (fd ↔ device_id) provides average O(1) lookups; when a device id re-registers on a new socket, the stale fd mapping is evicted.
 - Asynchronous Write Pipeline: Dynamic EPOLLOUT interest toggling prevents partial-write stalls and preserves strict message ordering.
@@ -119,7 +119,7 @@ The reactor never blocks on application work; all CPU-heavy or blocking operatio
 2. Wait: epoll_wait() blocks with no timeout until at least one registered file descriptor becomes ready.
 3. Dispatch:
    - Shutdown eventfd Ready: Read (drain) the eventfd counter and leave the loop.
-   - Listening Socket Ready: Drain accept() in a while (true) loop until EAGAIN. Configure each accepted client socket as non-blocking, register it with EPOLLIN | EPOLLET | EPOLLRDHUP, and create an AsyncWriteBuffer.
+   - Listening Socket Ready: Drain accept() in a while (true) loop until EAGAIN. Configure each accepted client socket as non-blocking, register it with EPOLLIN | EPOLLET | EPOLLRDHUP, and create an AsyncWriteBuffer. On EMFILE/ENFILE the reserved spare descriptor is released, the pending connection is accepted and closed, and the spare is reopened; the loop stops at EAGAIN, because Linux reports EMFILE even when no connection is waiting.
    - Socket Readable (EPOLLIN): Drain read() completely until EAGAIN; each read() of up to 1,024 bytes becomes one TelemetryPacket. If the fd is unregistered, attempt to parse an MQTT CONNECT; on success register the device id and queue a CONNACK (0x20 0x02 0x00 0x00). Otherwise tag the packet with the known device id. Every packet is then pushed to TelemetryPipeline (packets from a connection that never sent a valid CONNECT are processed as UNAUTHENTICATED).
    - Socket Error / Hang-Up (EPOLLERR, EPOLLHUP, EPOLLRDHUP): These often arrive together with EPOLLIN when a device sends its last data and closes, so the socket is always drained first and that data is processed normally. Then the descriptor is removed from the registry and from epoll (EPOLL_CTL_DEL) and closed.
    - Socket Writable (EPOLLOUT): If the connection is still open after reading, call handle_write_ready() to flush the outbound queue.
@@ -176,9 +176,11 @@ handle_write_ready() [Triggered by EPOLLOUT]
 ├── README.md     # Project documentation
 ├── LICENSE       # MIT License
 ├── deploy.sh     # Idempotent Linux dependency & build script
-├── server.cpp    # Epoll reactor, MQTT CONNECT parser, registry, write pipeline, and jthread worker pool
-├── client.cpp    # Device simulator: MQTT CONNECT + periodic JSON telemetry over an epoll reactor
-└── tests.cpp     # Standalone sanity checks (stop flag, thread teardown, payload format)
+├── server.cpp           # Epoll reactor, eventfd shutdown, accept/read/write dispatch and jthread worker pool
+├── server_core.hpp      # TelemetryPacket, ClientRegistry, SafeMqttParser, AsyncWriteBuffer, TelemetryPipeline, CONNACK bytes
+├── client.cpp           # Device simulator: MQTT CONNECT + periodic JSON telemetry over an epoll reactor
+├── mqtt_connect_frame.hpp  # MqttPacketFactory: builds the MQTT 3.1.1 CONNECT frame
+└── tests.cpp            # Unit tests for the code in server_core.hpp and mqtt_connect_frame.hpp
 ```
 
 ## Quick Start
@@ -246,7 +248,7 @@ Expected Output (abridged):
 ```
 # server
 [SERVER ENGINE] Monitoring port 8883 with Edge-Triggered Linux Epoll.
-[REGISTRY] Authenticated: Raw FD 6 Bound to ID -> MyDevice_01
+[REGISTRY] Authenticated: Raw FD 7 Bound to ID -> MyDevice_01
 [WORKER] Device: MyDevice_01 (Length: 25 bytes)
 [WORKER] Device: MyDevice_01 (Length: 28 bytes)
 ...
@@ -311,13 +313,23 @@ Draining is unbounded in time on the server: with a large backlog and slow proce
 
 ### Unit Testing (tests.cpp)
 
-tests.cpp is a standalone program with four quick sanity checks: the atomic stop flag starts true and can be cleared, a polling thread exits when the flag is cleared, and a sample CSV-style payload string has the expected format. It does not include server.cpp or client.cpp, so it does not exercise the reactor, parser, queue or shutdown path; those are verified by running the server and client together.
+tests.cpp includes the same headers the server and client are built from (server_core.hpp and mqtt_connect_frame.hpp), so it tests the real code. It uses no external framework and needs no running server. Its 24 checks cover:
+
+- CONNECT frame builder: exact bytes for a short id, and 2-byte remaining-length encoding for a 200-character id.
+- SafeMqttParser: round-trip of builder output (including a multi-byte remaining length and an empty id), and rejection of a wrong packet type, a truncated frame, a frame under 12 bytes, a 5-byte remaining length, a remaining length larger than the buffer, and an id length that points past the end of the buffer.
+- CONNACK bytes: `20 02 00 00`.
+- ClientRegistry: lookup, ghost-session eviction when a device reconnects on a new socket, removing the stale fd without dropping the live session, and removal.
+- TelemetryPipeline: the 10,000-packet cap with drop-oldest in FIFO order, draining every queued packet after shutdown(), nullptr once drained, and blocked workers waking and joining on shutdown().
+- AsyncWriteBuffer (over a socketpair): delivering a CONNACK, and returning false instead of raising SIGPIPE when the peer has closed.
+
+The epoll reactor, eventfd shutdown, client reactor and flush logic live in server.cpp and client.cpp and are verified by running the server and client together.
 
 ### Troubleshooting
 
 | Symptom | Likely Cause & Fix |
 |---------|--------------------|
 | Address already in use | Another process holds port 8883. Stop the conflicting process or update SERVER_PORT. |
+| "Out of file descriptors; rejected a connection" | The server hit its descriptor limit (`ulimit -n`); raise it or reduce concurrent clients. |
 | Client cannot connect | Confirm ./server is running and local firewall rules allow TCP traffic on port 8883. |
 | High idle CPU usage | Ensure epoll_wait is not called with a zero timeout (it should block with -1), that EPOLLOUT is disabled once the write queue is empty, and that accept()/read() loops exit cleanly on EAGAIN. |
 | No CONNACK | The first bytes on a new connection must be a CONNECT (0x10) frame of at least 12 bytes; otherwise the data is processed as UNAUTHENTICATED and no CONNACK is sent. |
