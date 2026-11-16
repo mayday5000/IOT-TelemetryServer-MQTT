@@ -2,15 +2,24 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-performance, low-power MQTT telemetry server and client written in modern C++23 for Linux IoT edge environments.
+A high-performance, low-power MQTT telemetry server and client written in modern C++23 for Linux IoT edge environments, where every CPU wake-up costs battery. It is designed for battery-powered, solar-powered and other energy-constrained edge gateways and devices.
 
 Built on a non-blocking, edge-triggered epoll reactor architecture, the server accepts concurrent TCP connections, validates binary MQTT CONNECT frames, maps devices via an O(1) bidirectional registry, issues CONNACK responses, and offloads payload processing to a static worker thread pool. Outbound traffic is throttled through an asynchronous write pipeline so slow cellular or Wi-Fi clients never block the main network thread.
 
-The companion client builds a proper MQTT CONNECT frame, sends it, then periodically emits small JSON telemetry messages. Both processes support deterministic, graceful shutdown on SIGINT and SIGTERM.
+**How it stays low-power:** nothing in the system busy-waits or polls on a timer. The reactor sleeps inside the kernel in `epoll_wait` with no timeout and is woken only when a socket is ready or when the shutdown `eventfd` is signaled, so an idle server adds zero periodic wake-ups. Idle worker threads block on a condition variable instead of polling the queue, and write readiness (`EPOLLOUT`) is requested only while outbound data is pending. The worker pool is created once at startup (no thread churn), and fixed-size packet buffers plus a capped queue keep memory bounded. Between bursts of telemetry, the process gives the CPU nothing to do, so it can stay in low-power idle states.
+
+The companion client builds a proper MQTT CONNECT frame, sends it, then periodically emits small JSON telemetry messages. Both processes support deterministic, graceful shutdown on SIGINT and SIGTERM, woken instantly through an `eventfd` instead of a polling timeout.
 
 ## Key Features
 
-- Edge-Triggered epoll Reactor: Single-threaded I/O multiplexing with EPOLLET and EPOLLRDHUP for near-zero idle CPU usage (~0%).
+- Zero Idle Wake-Ups (eventfd Shutdown): The reactor calls `epoll_wait(..., -1)` with no timeout. SIGINT/SIGTERM handlers write to an `eventfd` registered in the epoll set, so shutdown no longer depends on a periodic 500 ms wake-up to check a flag.
+- Sleep-Driven Event Loop: The reactor blocks in `epoll_wait` and is woken by the kernel only when a socket is ready or shutdown is requested, so the CPU can drop into idle states instead of spinning.
+- Zero Busy-Waiting Workers: Worker threads sleep on a `std::condition_variable` and wake only when a packet is queued or shutdown is requested.
+- On-Demand Write Interest: `EPOLLOUT` is enabled only while outbound data is pending, so the kernel never reports useless "writable" events that would wake the CPU.
+- No Runtime Thread Churn: The fixed worker pool is created once at startup, avoiding the CPU and memory cost of spawning threads per connection.
+- Bounded Memory Footprint: Fixed-size 1 KB packet buffers and a queue capped at 10,000 packets keep RAM usage predictable on constrained edge hardware.
+- Low-Duty-Cycle Client: The client sends small JSON payloads every 2 seconds and sleeps in between; its sleep is interruptible, so Ctrl-C stops it immediately.
+- Edge-Triggered epoll Reactor: Single-threaded I/O multiplexing with EPOLLET and EPOLLRDHUP.
 - Non-Blocking Accept & Read Loops: Exhaustive EAGAIN drain loops ensure the reactor never stalls on slow connections.
 - Zero-Allocation MQTT Parsing: Bounds-checked SafeMqttParser extracts client identifiers from CONNECT frames and dispatches CONNACK replies without buffer over-reads.
 - Bidirectional Client Registry: Dual std::unordered_map indexing (fd ↔ device_id) provides O(1) lookups and automatically evicts ghost sessions on rapid device reconnects.
@@ -19,7 +28,7 @@ The companion client builds a proper MQTT CONNECT frame, sends it, then periodic
 - Bounded Queue with Back-Pressure: Capped at 10,000 packets with a drop-oldest eviction policy to prevent unbounded memory growth under load.
 - RAII Memory Scrubbing: TelemetryPacket destructors automatically zero out payload buffers via std::memset upon scope exit—even if an exception is thrown.
 - Modern C++23 Primitives: Uses std::jthread, std::expected, std::span, and std::atomic with explicit memory ordering for safe resource management and explicit error handling.
-- Graceful Shutdown: Signal-driven (SIGINT/SIGTERM) atomic teardown drains queues and joins all worker threads cleanly.
+- Graceful Shutdown: SIGINT/SIGTERM set an atomic stop flag and ring the shutdown `eventfd`, waking the reactor instantly (no polling delay) from whichever thread received the signal; the server then wakes the workers and joins all worker threads cleanly.
 
 ## System Architecture
 
@@ -27,14 +36,16 @@ The companion client builds a proper MQTT CONNECT frame, sends it, then periodic
 
 ```
 Bootstrap (main thread)
+  create shutdown eventfd
   install signal handlers
   spawn jthread worker pool
         │
         ▼
 Reactor loop (main thread)
   while (g_running)
-    epoll_wait(500 ms)
+    epoll_wait(-1)              // sleep until I/O or shutdown
     for each ready event
+      ├─ eventfd    → drain it, stop the loop
       ├─ listen fd  → drain accept until EAGAIN
       ├─ EPOLLIN    → drain read until EAGAIN
       │                 parse CONNECT if new, else tag + push
@@ -50,10 +61,11 @@ Workers (background)
         │
         ▼
 Shutdown
-  signal sets g_running = false
+  signal sets g_running = false and writes 1 to the eventfd
+  reactor wakes immediately, drains eventfd, exits loop
   pipeline->shutdown() + notify_all()
-  jthread destructors join workers
-  close listening socket and epoll fd
+  workers wake and exit, jthreads join
+  close listening socket, epoll fd and eventfd
 ```
 
 ### 1. Reactor & Worker Pool Model
@@ -63,12 +75,14 @@ Instead of blocking one thread per client, one reactor thread monitors all file 
 ```
 MAIN THREAD (Reactor)
   g_running = true
+  create shutdown eventfd
   install SIGINT/SIGTERM handlers
   spawn std::jthread worker pool
   ┌─────────────────────────────────────────┐
   │ while (g_running)                       │
-  │   epoll_wait(..., 500 ms)               │ ◄── ~0% CPU while waiting
-  │   handle accept / read / write / hangups│
+  │   epoll_wait(..., -1)                   │ ◄── Sleeps in kernel, zero idle wake-ups
+  │   handle eventfd / accept / read /      │
+  │          write / hangups                │
   └─────────────────────────────────────────┘
   g_running = false
   pipeline->shutdown() ──► notify_all()
@@ -103,9 +117,10 @@ The reactor never blocks on application work; all CPU-heavy or blocking operatio
                  └─────────────────────────┘
 ```
 
-1. Setup: Create a non-blocking TCP listening socket, initialize an epoll instance, and register the socket with EPOLLIN | EPOLLET.
-2. Wait: epoll_wait() blocks until at least one registered file descriptor becomes ready or the 500 ms timeout expires.
+1. Setup: Create a non-blocking TCP listening socket, initialize an epoll instance, register the socket with EPOLLIN | EPOLLET, and register the shutdown eventfd with EPOLLIN.
+2. Wait: epoll_wait() blocks with no timeout until at least one registered file descriptor becomes ready.
 3. Dispatch:
+   - Shutdown eventfd Ready: Read (drain) the eventfd counter and leave the loop.
    - Listening Socket Ready: Drain accept() in a while (true) loop until EAGAIN. Configure each accepted client socket as non-blocking, register it with EPOLLIN | EPOLLET | EPOLLRDHUP, and create an AsyncWriteBuffer.
    - Socket Error / Hang-Up: Remove the descriptor from the registry and from epoll (EPOLL_CTL_DEL), then close it immediately.
    - Socket Readable (EPOLLIN): Drain read() completely until EAGAIN. If the fd is unregistered, attempt to parse an MQTT CONNECT, register the device id, and enqueue a CONNACK. Otherwise tag the packet with the known device id and push it to TelemetryPipeline.
@@ -127,10 +142,11 @@ CLIENT ARCHITECTURE:
 ┌─────────────────────────────┐     ┌──────────────────────────────┐
 │  Telemetry Worker Thread    │     │  Main Thread (Reactor)       │
 │                             │     │                              │
-│  Every 2 seconds:           │     │  epoll_wait(500 ms)          │
+│  Every 2 seconds:           │     │  epoll_wait(-1)              │
 │    Build JSON metric        │────►│  EPOLLOUT ──► Flush writes   │
 │    pipeline->send_payload() │     │  EPOLLIN  ──► Read CONNACK   │
-│                             │     │  Hangup   ──► Trigger stop   │
+│  Sleeps on condition_var,   │◄────│  Hangup   ──► Trigger stop   │
+│  woken at once on shutdown  │     │  eventfd  ──► Trigger stop   │
 └─────────────────────────────┘     └──────────────────────────────┘
                  │                                  │
                  └──── Shared ClientWritePipeline ──┘
@@ -253,15 +269,17 @@ The codebase targets C++23 and leverages standard-library facilities to enforce 
 
 ## Detailed Shutdown Sequence
 
-The 500 ms epoll_wait timeout caps shutdown latency at half a second while avoiding the overhead of an extra eventfd:
+The reactor waits with no timeout, so shutdown is delivered through an eventfd registered in the epoll set. This costs one extra file descriptor and removes both the periodic idle wake-ups and the shutdown delay:
 
-1. SIGINT/SIGTERM handler executes an async-signal-safe store (g_running = false).
-2. Next epoll_wait returns (via timeout or EINTR).
-3. Reactor loop condition evaluates to false and exits.
+1. SIGINT/SIGTERM handler performs only async-signal-safe work: it stores g_running = false and write()s a uint64_t 1 to the eventfd (preserving errno).
+2. The eventfd becomes readable, so epoll_wait returns immediately, no matter which thread received the signal. If the signal arrives just before epoll_wait is entered, the counter is already set and epoll_wait returns at once, so the signal cannot be missed. If epoll_wait is interrupted with EINTR, the loop re-checks the flag.
+3. The reactor drains the eventfd and exits its loop.
 4. pipeline->shutdown() sets the internal stop flag and broadcasts notify_all().
-5. Workers blocked in pop() wake, receive nullptr, and exit their loops.
-6. std::vector<std::jthread> destruction automatically joins every worker.
-7. Listening socket and epoll file descriptor are closed.
+5. Workers blocked in pop() wake and exit their loops (pop() returns nullptr once the queue is empty, and the loop also stops on g_running = false).
+6. The std::jthread workers are joined.
+7. Listening socket, epoll file descriptor and eventfd are closed.
+
+The client follows the same pattern: its reactor wakes on the eventfd, then notifies a condition variable so the telemetry thread leaves its 2-second sleep immediately instead of finishing it.
 
 ## Testing, Troubleshooting & Production Hardening
 
@@ -275,7 +293,7 @@ tests.cpp validates the deterministic stop-flag contract, worker thread teardown
 |---------|--------------------|
 | Address already in use | Another process holds port 8883. Stop the conflicting process or update SERVER_PORT. |
 | Client cannot connect | Confirm ./server is running and local firewall rules allow TCP traffic on port 8883. |
-| High idle CPU usage | Ensure epoll_wait uses a non-zero timeout (500 ms) and that accept()/read() loops exit cleanly on EAGAIN. |
+| High idle CPU usage | Ensure epoll_wait is not called with a zero timeout (it should block with -1), that EPOLLOUT is disabled once the write queue is empty, and that accept()/read() loops exit cleanly on EAGAIN. |
 | No CONNACK | Verify the CONNECT frame is well-formed and that the write pipeline is flushing on EPOLLOUT. |
 
 ### Scaling & Production Hardening
