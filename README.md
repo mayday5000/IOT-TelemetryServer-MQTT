@@ -316,7 +316,7 @@ Draining is unbounded in time on the server: with a large backlog and slow proce
 tests.cpp includes the same headers the server and client are built from (server_core.hpp and mqtt_connect_frame.hpp), so it tests the real code. It uses no external framework and needs no running server. Its 24 checks cover:
 
 - CONNECT frame builder: exact bytes for a short id, and 2-byte remaining-length encoding for a 200-character id.
-- SafeMqttParser: round-trip of builder output (including a multi-byte remaining length and an empty id), and rejection of a wrong packet type, a truncated frame, a frame under 12 bytes, a 5-byte remaining length, a remaining length larger than the buffer, and an id length that points past the end of the buffer.
+- SafeMqttParser: round-trip of builder output (including a multi-byte remaining length and an empty id), and rejection of a wrong packet type, a truncated frame, a frame under 12 bytes, a 5-byte remaining length, a remaining length larger than the buffer, a remaining payload too short to hold the 2-byte client-id length field, and an id length that points past the end of the remaining payload or the buffer.
 - CONNACK bytes: `20 02 00 00`.
 - ClientRegistry: lookup, ghost-session eviction when a device reconnects on a new socket, removing the stale fd without dropping the live session, and removal.
 - TelemetryPipeline: the 10,000-packet cap with drop-oldest in FIFO order, draining every queued packet after shutdown(), nullptr once drained, and blocked workers waking and joining on shutdown().

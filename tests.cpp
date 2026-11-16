@@ -74,6 +74,23 @@ static void test_parser() {
     auto lying_id = MqttPacketFactory::create_connect_frame("abc");
     lying_id[12] = 0x7F; // id length high byte -> ~32 KB id declared in a 17-byte frame
     CHECK("parser: rejects id length past end of buffer", !parse(lying_id));
+
+    // remaining_length = 11: 10-byte variable header + only one of the two id-length bytes.
+    // The old index+10 check treated this as long enough and read one byte past the buffer.
+    std::vector<uint8_t> short_idlen = {
+        0x10, 11,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00};
+    CHECK("parser: rejects 11-byte remaining payload (truncated id length field)", !parse(short_idlen));
+
+    // Empty-id CONNECT (remaining_length 12) plus two extra bytes in the same buffer,
+    // with id_len patched to 2 so a buffer-only check would accept "XY" as the id.
+    auto id_past_remaining = MqttPacketFactory::create_connect_frame("");
+    id_past_remaining.push_back('X');
+    id_past_remaining.push_back('Y');
+    id_past_remaining[13] = 2; // id length low byte
+    CHECK("parser: rejects id length past remaining length (still inside buffer)", !parse(id_past_remaining));
 }
 
 static void test_connack() {

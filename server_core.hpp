@@ -120,13 +120,17 @@ public:
             if ((byte & 128) == 0) break;
         }
 
-        if (index + remaining_length > length || index + 10 >= length) return std::nullopt;
+        // Remaining payload must fit in the buffer and include the 10-byte variable
+        // header plus the 2-byte client-id length prefix (index + 10 was one byte short
+        // and could read buffer[index + 11] out of bounds).
+        if (remaining_length < 12 || index + remaining_length > length) return std::nullopt;
+        const size_t remaining_end = index + remaining_length;
         index += 10; // Fast-forward past standard verification protocol blocks
 
         uint16_t id_len = (static_cast<uint16_t>(buffer[index]) << 8) | buffer[index + 1];
         index += 2;
 
-        if (index + id_len > length) return std::nullopt; // Structural string overrun check
+        if (index + id_len > remaining_end) return std::nullopt; // Structural string overrun check
         return std::string(reinterpret_cast<const char*>(&buffer[index]), id_len);
     }
 };
