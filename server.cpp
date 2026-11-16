@@ -367,6 +367,9 @@ int main() {
     wake_ev.data.fd = g_wake_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_wake_fd, &wake_ev);
 
+    // Spare descriptor released on EMFILE so a pending connection can be accepted and closed
+    int spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
     std::vector<epoll_event> events(MAX_EVENTS);
     std::cout << "[SERVER ENGINE] Monitoring port " << SERVER_PORT << " with Edge-Triggered Linux Epoll.\n";
 
@@ -395,6 +398,20 @@ int main() {
                     int client_fd = accept(server_fd, nullptr, nullptr);
                     if (client_fd == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno == EINTR || errno == ECONNABORTED) continue;
+                        if ((errno == EMFILE || errno == ENFILE) && spare_fd != -1) {
+                            // Out of descriptors: free the spare, accept and close the pending connection,
+                            // so it does not sit in the backlog with no further edge to wake us.
+                            // (Linux reports EMFILE even when the backlog is empty, so stop on EAGAIN.)
+                            close(spare_fd);
+                            int rejected = accept(server_fd, nullptr, nullptr);
+                            if (rejected != -1) close(rejected);
+                            spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                            if (rejected == -1) break;
+                            std::cerr << "[SERVER ENGINE] Out of file descriptors; rejected a connection.\n";
+                            continue;
+                        }
+                        std::cerr << "[SERVER ENGINE] accept() failed: " << std::strerror(errno) << "\n";
                         break;
                     }
 
@@ -483,6 +500,7 @@ int main() {
     close(server_fd);
     close(epoll_fd);
     close(g_wake_fd);
+    if (spare_fd != -1) close(spare_fd);
     std::cout << "[SERVER ENGINE] Shutdown complete.\n";
     return 0;
 }
