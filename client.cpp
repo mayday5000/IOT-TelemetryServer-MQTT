@@ -1,7 +1,8 @@
 // client.cpp
-// Purpose: MQTT-aware edge-triggered epoll reactor for IoT telemetry.
-// How it works: reactor accepts, parses MQTT CONNECT, queues packets for workers;
-// non-blocking write pipeline handles outbound CONNACK and other responses.
+// Purpose: Low-power MQTT telemetry client for IoT edge devices.
+// How it works: connect -> send CONNECT -> await CONNACK (chained with std::expected::and_then);
+// telemetry starts only after the server accepts the client. On any failure or a dropped
+// connection the client logs the reason and reconnects with exponential backoff.
 
 #include <iostream>
 #include <vector>
@@ -9,8 +10,11 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <stop_token>
 #include <atomic>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <cstring>
 #include <cstdint>
 #include <chrono>
@@ -18,23 +22,29 @@
 #include <cerrno>
 #include <expected>
 #include <span>
+#include <algorithm>
 
 // Linux Native System Headers
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
 
-constexpr size_t MAX_EVENTS        = 8;
-constexpr size_t TARGET_STACK_SIZE = 64 * 1024; // Low-power 64 KB thread micro-stack
-constexpr int    FLUSH_TIMEOUT_MS  = 1000;      // Max time to flush pending writes on shutdown
+#include "net_util.hpp"
+#include "mqtt_connect_frame.hpp"
+
+using namespace std::chrono_literals;
+
+constexpr size_t   MAX_EVENTS       = 8;
+constexpr uint16_t SERVER_PORT      = 8883;
+constexpr auto     TELEMETRY_PERIOD = 2s;     // Sensor sample interval
+constexpr auto     CONNECT_TIMEOUT  = 5s;     // TCP connect
+constexpr auto     CONNACK_TIMEOUT  = 5s;     // Server must answer the CONNECT within this time
+constexpr auto     BACKOFF_MIN      = 1s;     // First retry delay, doubled after each failure...
+constexpr auto     BACKOFF_MAX      = 30s;    // ...up to this cap; reset after a successful handshake
+constexpr auto     FLUSH_TIMEOUT    = 1000ms; // Max time to flush pending writes on shutdown
 
 // ============================================================================
-// 🌊 1. EDGE-TRIGGERED NON-BLOCKING ASYNC WRITE PIPELINE
+// Edge-triggered non-blocking async write pipeline (does not own the descriptors)
 // ============================================================================
 class ClientWritePipeline {
 private:
@@ -45,67 +55,61 @@ private:
     std::mutex write_mutex_;
     std::atomic<bool> broken_{false}; // Set once a send fails hard (EPIPE, ECONNRESET, ...)
 
-    void update_epoll_mask(bool enable_write) {
+    [[nodiscard]] bool update_epoll_mask(bool enable_write) {
         epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP; 
-        if (enable_write) {
-            ev.events |= EPOLLOUT; 
-        }
+        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+        if (enable_write) ev.events |= EPOLLOUT;
         ev.data.fd = socket_fd_;
-        epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, socket_fd_, &ev);
+        return epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, socket_fd_, &ev) != -1;
+    }
+
+    bool fail() {
+        broken_.store(true, std::memory_order_relaxed);
+        return false;
     }
 
 public:
-    bool is_broken() const { return broken_.load(std::memory_order_relaxed); }
+    ClientWritePipeline(int socket_fd, int epoll_fd) : socket_fd_(socket_fd), epoll_fd_(epoll_fd) {}
 
-    bool has_pending() {
+    [[nodiscard]] bool is_broken() const { return broken_.load(std::memory_order_relaxed); }
+
+    [[nodiscard]] bool has_pending() {
         std::lock_guard<std::mutex> lock(write_mutex_);
         return !outbound_queue_.empty();
     }
 
-    ClientWritePipeline(int socket_fd, int epoll_fd) 
-        : socket_fd_(socket_fd), epoll_fd_(epoll_fd) {}
-
     // Returns false on a hard socket error (EPIPE, ECONNRESET, ...): the connection is gone
-    bool send_payload(const uint8_t* data, size_t length) {
+    [[nodiscard]] bool send_payload(std::span<const uint8_t> data) {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        if (broken_.load(std::memory_order_relaxed)) return false;
+        if (is_broken()) return false;
 
         if (!outbound_queue_.empty()) {
-            outbound_queue_.push(std::vector<uint8_t>(data, data + length));
+            outbound_queue_.emplace(data.begin(), data.end());
             return true;
         }
 
         ssize_t bytes_written;
         do { // MSG_NOSIGNAL: a reset peer yields EPIPE instead of a process-killing SIGPIPE
-            bytes_written = send(socket_fd_, data, length, MSG_NOSIGNAL);
+            bytes_written = send(socket_fd_, data.data(), data.size(), MSG_NOSIGNAL);
         } while (bytes_written == -1 && errno == EINTR);
 
         if (bytes_written >= 0) {
-            size_t written = static_cast<size_t>(bytes_written);
-            if (written < length) {
-                std::vector<uint8_t> remaining(data + written, data + length);
-                outbound_queue_.push(std::move(remaining));
-                pending_offset_ = 0;
-                update_epoll_mask(true);
-            }
+            const auto rest = data.subspan(static_cast<size_t>(bytes_written));
+            if (rest.empty()) return true;
+            outbound_queue_.emplace(rest.begin(), rest.end());
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            outbound_queue_.emplace(data.begin(), data.end());
         } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                outbound_queue_.push(std::vector<uint8_t>(data, data + length));
-                pending_offset_ = 0;
-                update_epoll_mask(true);
-            } else {
-                broken_.store(true, std::memory_order_relaxed);
-                return false;
-            }
+            return fail();
         }
-        return true;
+        pending_offset_ = 0;
+        return update_epoll_mask(true) || fail();
     }
 
     // Returns false on a hard socket error (EPIPE, ECONNRESET, ...)
-    bool handle_write_ready() {
+    [[nodiscard]] bool handle_write_ready() {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        if (broken_.load(std::memory_order_relaxed)) return false;
+        if (is_broken()) return false;
 
         while (!outbound_queue_.empty()) {
             const auto& current_chunk = outbound_queue_.front();
@@ -117,7 +121,7 @@ public:
                 size_t written = static_cast<size_t>(bytes_written);
                 if (written < bytes_left) {
                     pending_offset_ += written;
-                    return true; 
+                    return true;
                 } else {
                     outbound_queue_.pop();
                     pending_offset_ = 0;
@@ -125,32 +129,21 @@ public:
             } else {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-                broken_.store(true, std::memory_order_relaxed); // EPIPE / ECONNRESET: peer is gone
-                return false;
+                return fail(); // EPIPE / ECONNRESET: peer is gone
             }
         }
-        update_epoll_mask(false); // Queue dry. Stop spinning.
-        return true;
+        return update_epoll_mask(false) || fail(); // Queue dry. Stop asking for EPOLLOUT.
     }
 };
 
-#include "mqtt_connect_frame.hpp"
-
-// Utility function to modify socket control descriptor settings
-bool make_socket_non_blocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return false;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
-}
-
 // ============================================================================
-// 🏛️ 3. MAIN RUNTIME EXECUTION GATEWAY
+// Signals
 // ============================================================================
 
 // Global stop flag reachable by signal handler
 std::atomic<bool> g_client_active{true};
 
-// Shutdown "doorbell": eventfd watched by epoll so the reactor can sleep with no timeout
+// Plain copy of the shutdown "doorbell" eventfd (owned by a UniqueFd in main) for the signal handler
 int g_wake_fd = -1;
 
 void signal_handler(int) {
@@ -161,17 +154,153 @@ void signal_handler(int) {
     errno = saved_errno;
 }
 
-int main(int argc, char* argv[]) {
-    std::string device_name = (argc > 1) ? argv[1] : "IoT_Edge_Node_01";
-    std::string server_ip   = (argc > 2) ? argv[2] : "127.0.0.1";
-    int server_port         = 8883;
+// ============================================================================
+// One accepted session: telemetry thread + reactor until shutdown or connection loss
+// ============================================================================
+enum class SessionEnd { Shutdown, ConnectionLost };
 
-    // Create the shutdown eventfd before handlers can fire
-    g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (g_wake_fd == -1) {
-        std::cerr << "[CRITICAL] eventfd creation failed.\n";
+SessionEnd run_session(UniqueFd sock, uint32_t& message_counter) {
+    // Session epoll set: socket, shutdown eventfd, and a "lost" eventfd the telemetry thread rings
+    auto epoll = make_epoll();
+    auto lost  = make_eventfd();
+    if (!epoll || !lost) {
+        std::cerr << "[CLIENT] Session setup failed: " << (!epoll ? epoll.error() : lost.error()) << "\n";
+        return SessionEnd::ConnectionLost;
+    }
+    const int epoll_fd = epoll->get();
+    const int lost_fd  = lost->get();
+    for (auto [fd, mask] : {std::pair{sock.get(), uint32_t{EPOLLIN | EPOLLET | EPOLLRDHUP}},
+                            std::pair{g_wake_fd, uint32_t{EPOLLIN}}, std::pair{lost_fd, uint32_t{EPOLLIN}}}) {
+        if (auto added = epoll_add(epoll_fd, fd, mask); !added) {
+            std::cerr << "[CLIENT] Session setup failed: " << added.error() << "\n";
+            return SessionEnd::ConnectionLost;
+        }
+    }
+
+    ClientWritePipeline pipeline(sock.get(), epoll_fd);
+
+    // Low-power telemetry thread: sleeps between samples; request_stop() wakes it at once
+    std::jthread telemetry([&](std::stop_token stop) {
+        std::mutex sleep_mutex;
+        std::condition_variable_any sleep_cv;
+        while (true) {
+            {
+                std::unique_lock lock(sleep_mutex);
+                (void)sleep_cv.wait_for(lock, stop, TELEMETRY_PERIOD, [] { return false; });
+            }
+            if (stop.stop_requested()) break;
+
+            std::string metric = "{\"msg_idx\":" + std::to_string(message_counter++) + ",\"temp_c\":24.85}";
+            if (!pipeline.send_payload(std::span(reinterpret_cast<const uint8_t*>(metric.data()), metric.size()))) {
+                std::cerr << "[TELEMETRY] Send failed: " << std::strerror(errno) << ".\n";
+                uint64_t one = 1;
+                (void)!write(lost_fd, &one, sizeof(one)); // Tell the reactor the connection is gone
+                break;
+            }
+        }
+    });
+
+    std::vector<epoll_event> events(MAX_EVENTS);
+    const char* reason = nullptr;
+
+    while (reason == nullptr && g_client_active.load(std::memory_order_relaxed)) {
+        // Sleep until socket I/O or an eventfd wakes us
+        int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1);
+        if (num_events == -1) {
+            if (errno == EINTR) continue;
+            reason = "epoll_wait failed";
+            break;
+        }
+
+        for (int i = 0; i < num_events && reason == nullptr; ++i) {
+            const int fd = events[i].data.fd;
+            const uint32_t revents = events[i].events;
+
+            if (fd == g_wake_fd) {
+                uint64_t counter = 0;
+                (void)!read(g_wake_fd, &counter, sizeof(counter)); // Drain the doorbell
+                g_client_active.store(false, std::memory_order_relaxed);
+                break;
+            }
+            if (fd == lost_fd) { reason = "telemetry send failed"; break; }
+
+            // Read first, so data that arrives together with a hang-up is not lost
+            if (revents & EPOLLIN) {
+                uint8_t buf[256];
+                ssize_t n;
+                while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                    std::cout << "[REACTOR] Received " << n << " bytes from server\n";
+                }
+                if (n == 0) { reason = "server closed the connection"; break; }
+                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { reason = std::strerror(errno); break; }
+            }
+            if (revents & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) { reason = "connection closed by peer or error"; break; }
+            if ((revents & EPOLLOUT) && !pipeline.handle_write_ready()) { reason = "write failed (connection reset by peer)"; break; }
+        }
+    }
+
+    telemetry.request_stop();
+    telemetry.join();
+
+    if (reason != nullptr) {
+        std::cerr << "[CLIENT] Connection lost: " << reason << ".\n";
+        return SessionEnd::ConnectionLost;
+    }
+
+    // Shutdown: bounded flush, so queued telemetry gets up to FLUSH_TIMEOUT to reach the server.
+    // Skipped if the connection is broken; a second Ctrl-C (eventfd) aborts it.
+    if (!pipeline.is_broken() && pipeline.has_pending()) {
+        std::cout << "[CLIENT] Flushing pending telemetry before exit...\n";
+        uint64_t counter = 0;
+        (void)!read(g_wake_fd, &counter, sizeof(counter)); // Clear the first Ctrl-C if the loop exited before draining it
+        auto deadline = std::chrono::steady_clock::now() + FLUSH_TIMEOUT;
+        bool abort_flush = false;
+        while (!abort_flush && pipeline.has_pending()) {
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0) break;
+            int n = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, static_cast<int>(left));
+            if (n == -1) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            for (int i = 0; i < n; ++i) {
+                if (events[i].data.fd != sock.get() ||
+                    (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))) { abort_flush = true; break; }
+                if ((events[i].events & EPOLLOUT) && !pipeline.handle_write_ready()) { abort_flush = true; break; }
+            }
+        }
+        if (pipeline.has_pending()) std::cerr << "[CLIENT] Unsent telemetry discarded at shutdown.\n";
+    }
+    return SessionEnd::Shutdown;
+}
+
+// ============================================================================
+// Main: configuration, then handshake + reconnect loop with exponential backoff
+// ============================================================================
+int main(int argc, char* argv[]) {
+    std::span<char*> args(argv, static_cast<size_t>(argc));
+    std::string_view device_name = (args.size() > 1) ? std::string_view{args[1]} : "IoT_Edge_Node_01";
+    const char* server_ip        = (args.size() > 2) ? args[2] : "127.0.0.1"; // NUL-terminated for inet_pton
+
+    // Configuration errors cannot be fixed by retrying: report and exit non-zero
+    auto connect_frame = MqttPacketFactory::create_connect_frame(device_name);
+    if (!connect_frame) {
+        std::cerr << "[CONFIG] Client id is too long (" << device_name.size() << " bytes, max "
+                  << MqttPacketFactory::kMaxClientIdLen << ").\n";
         return 1;
     }
+    if (auto addr = parse_ipv4(server_ip, SERVER_PORT); !addr) {
+        std::cerr << "[CONFIG] '" << server_ip << "': " << addr.error() << ".\n";
+        return 1;
+    }
+
+    // Create the shutdown eventfd before handlers can fire
+    auto wake = make_eventfd();
+    if (!wake) {
+        std::cerr << "[CRITICAL] " << wake.error() << "\n";
+        return 1;
+    }
+    g_wake_fd = wake->get();
 
     // Install graceful shutdown handlers
     std::signal(SIGINT,  signal_handler);
@@ -182,187 +311,32 @@ int main(int argc, char* argv[]) {
     ignore_pipe.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &ignore_pipe, nullptr);
 
-    // Allocate connection socket
-    int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd == -1) {
-        std::cerr << "[CRITICAL] Failed generating socket structures.\n";
-        return 1;
-    }
-
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr);
-
-    std::cout << "[CLIENT] Attempting connection link to server: " << server_ip << ":" << server_port << "\n";
-    
-    // Connect synchronously first, then shift to non-blocking edge pipelines
-    if (connect(sock_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "[ERROR] Physical remote connection link refused or timeout reached.\n";
-        close(sock_fd);
-        return 1;
-    }
-
-    if (!make_socket_non_blocking(sock_fd)) {
-        std::cerr << "[ERROR] Failed configuring async flags.\n";
-        close(sock_fd);
-        return 1;
-    }
-
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        close(sock_fd);
-        return 1;
-    }
-
-    // Register our runtime interface with Edge-Triggered connection drop monitoring configurations
-    epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-    ev.data.fd = sock_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_fd, &ev);
-
-    // Register the shutdown eventfd so a signal wakes the reactor instantly
-    epoll_event wake_ev{};
-    wake_ev.events = EPOLLIN;
-    wake_ev.data.fd = g_wake_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_wake_fd, &wake_ev);
-
-    auto pipeline = std::make_shared<ClientWritePipeline>(sock_fd, epoll_fd);
-
-    // Build CONNECT frame once
-    auto connect_packet = MqttPacketFactory::create_connect_frame(device_name);
-
-    // Lets the reactor interrupt the telemetry thread's 2 s sleep on shutdown
-    std::mutex sleep_mutex;
-    std::condition_variable sleep_cv;
-
-    // ============================================================================
-    // 🔒 4. DECOUPLED TELEMETRY HARNESS LOOP (LOW-POWER BACKGROUND THREAD)
-    // ============================================================================
-    std::thread telemetry_worker([pipeline, connect_packet, device_name, &sleep_mutex, &sleep_cv]() {
-        // Step A: Send MQTT CONNECT
-        std::cout << "[TELEMETRY] Sending CONNECT for device: " << device_name << "\n";
-        if (!pipeline->send_payload(connect_packet.data(), connect_packet.size())) {
-            std::cerr << "[TELEMETRY] CONNECT send failed (connection reset). Stopping.\n";
-            g_client_active.store(false, std::memory_order_relaxed);
-            uint64_t one = 1;
-            (void)!write(g_wake_fd, &one, sizeof(one)); // Wake the reactor so it shuts down
-            return;
-        }
-
-        uint32_t message_counter = 0;
-
-        // Step B: Loop simulation representing ongoing low-overhead physical telemetry streams
-        while (g_client_active.load(std::memory_order_relaxed)) {
-            // Read physical sensors every 2 seconds; sleep, but wake at once on shutdown
-            std::unique_lock<std::mutex> lock(sleep_mutex);
-            if (sleep_cv.wait_for(lock, std::chrono::seconds(2),
-                    [] { return !g_client_active.load(std::memory_order_relaxed); })) break;
-            lock.unlock();
-
-            std::string metric = "{\"msg_idx\":" + std::to_string(message_counter++) + ",\"temp_c\":24.85}";
-            
-            // Raw inline transfer to background writer pipeline
-            if (!pipeline->send_payload(reinterpret_cast<const uint8_t*>(metric.data()), metric.length())) {
-                std::cerr << "[TELEMETRY] Send failed (connection reset). Stopping.\n";
-                g_client_active.store(false, std::memory_order_relaxed);
-                uint64_t one = 1;
-                (void)!write(g_wake_fd, &one, sizeof(one)); // Wake the reactor so it shuts down
-                break;
-            }
-        }
-        std::cout << "[TELEMETRY] Background worker detached cleanly.\n";
-    });
-
-    // ============================================================================
-    // ⚡ 5. REACTOR COMPONENT: MONITORING LOOP FOR SYSTEM EVENTS
-    // ============================================================================
-    std::vector<epoll_event> events(MAX_EVENTS);
-    std::cout << "[REACTOR] Client network loop activated safely.\n";
-    bool peer_closed = false;
+    std::chrono::milliseconds backoff = BACKOFF_MIN;
+    uint32_t message_counter = 0;
 
     while (g_client_active.load(std::memory_order_relaxed)) {
-        // Sleep until socket I/O or the shutdown eventfd wakes us
-        int num_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1);
-        if (num_events == -1) {
-            if (errno == EINTR) continue;
-            break;
+        std::cout << "[CLIENT] Connecting to " << server_ip << ":" << SERVER_PORT << " as '" << device_name << "'...\n";
+
+        // connect -> send CONNECT -> await CONNACK; the first failing step short-circuits to the end
+        auto session = connect_to(server_ip, SERVER_PORT, g_wake_fd, CONNECT_TIMEOUT)
+            .and_then([&](UniqueFd fd) { return send_connect(std::move(fd), *connect_frame, g_wake_fd, CONNECT_TIMEOUT); })
+            .and_then([&](UniqueFd fd) { return await_connack(std::move(fd), g_wake_fd, CONNACK_TIMEOUT); });
+
+        if (session) {
+            std::cout << "[CLIENT] CONNACK accepted: streaming telemetry.\n";
+            backoff = BACKOFF_MIN; // Reset after a successful handshake
+            if (run_session(std::move(*session), message_counter) == SessionEnd::Shutdown) break;
+        } else {
+            if (session.error().op == Op::Interrupted) break;
+            std::cerr << "[CLIENT] Handshake failed: " << session.error() << ".\n";
         }
 
-        for (int i = 0; i < num_events; ++i) {
-            if (events[i].data.fd == g_wake_fd) {
-                uint64_t counter = 0;
-                (void)!read(g_wake_fd, &counter, sizeof(counter)); // Drain the doorbell
-                g_client_active.store(false, std::memory_order_relaxed);
-                break;
-            }
-            if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                std::cerr << "[CLIENT] Connection closed by peer or error.\n";
-                peer_closed = true;
-                g_client_active.store(false, std::memory_order_relaxed);
-                break;
-            }
-            if (events[i].events & EPOLLOUT) {
-                if (!pipeline->handle_write_ready()) {
-                    std::cerr << "[CLIENT] Write failed (connection reset by peer).\n";
-                    peer_closed = true;
-                    g_client_active.store(false, std::memory_order_relaxed);
-                    break;
-                }
-            }
-            if (events[i].events & EPOLLIN) {
-                uint8_t buf[256];
-                ssize_t n;
-                while ((n = read(sock_fd, buf, sizeof(buf))) > 0) {
-                    // Minimal CONNACK / data handling (teaching stub)
-                    std::cout << "[REACTOR] Received " << n << " bytes from server\n";
-                }
-                if (n == 0) {
-                    std::cerr << "[CLIENT] Peer closed connection.\n";
-                    peer_closed = true;
-                    g_client_active.store(false, std::memory_order_relaxed);
-                    break;
-                }
-            }
-        }
+        // Interruptible backoff sleep: poll() on the eventfd only, so it wakes once, or at Ctrl+C
+        std::cerr << "[CLIENT] Retrying in " << backoff.count() / 1000.0 << " s.\n";
+        if (wait_fd(-1, 0, g_wake_fd, backoff) == Wait::Woken) break;
+        backoff = std::min(backoff * 2, std::chrono::milliseconds(BACKOFF_MAX));
     }
 
-    {
-        std::lock_guard<std::mutex> lock(sleep_mutex);
-        g_client_active.store(false, std::memory_order_relaxed);
-    }
-    sleep_cv.notify_all(); // Wake the telemetry thread from its 2 s sleep
-    if (telemetry_worker.joinable()) telemetry_worker.join();
-    if (pipeline->is_broken()) peer_closed = true; // A failed send means the server is gone
-
-    // Bounded flush: give queued telemetry up to FLUSH_TIMEOUT_MS to reach the server.
-    // Skipped if the peer is gone; a second Ctrl-C (eventfd) aborts it.
-    if (!peer_closed && pipeline->has_pending()) {
-        std::cout << "[CLIENT] Flushing pending telemetry before exit...\n";
-        uint64_t counter = 0;
-        (void)!read(g_wake_fd, &counter, sizeof(counter)); // Clear the first Ctrl-C (loop may have exited via EINTR)
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(FLUSH_TIMEOUT_MS);
-        bool abort_flush = false;
-        while (!abort_flush && pipeline->has_pending()) {
-            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-            if (left <= 0) break;
-            int n = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, static_cast<int>(left));
-            if (n == -1) {
-                if (errno == EINTR) continue;
-                break;
-            }
-            for (int i = 0; i < n; ++i) {
-                if (events[i].data.fd == g_wake_fd ||
-                    (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))) { abort_flush = true; break; }
-                if ((events[i].events & EPOLLOUT) && !pipeline->handle_write_ready()) { abort_flush = true; break; }
-            }
-        }
-        if (pipeline->has_pending()) std::cerr << "[CLIENT] Unsent telemetry discarded at shutdown.\n";
-    }
-
-    close(sock_fd);
-    close(epoll_fd);
-    close(g_wake_fd);
     std::cout << "[CLIENT] Shutdown complete.\n";
     return 0;
 }
