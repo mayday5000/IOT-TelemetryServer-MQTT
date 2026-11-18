@@ -5,55 +5,45 @@
 
 #include <iostream>
 #include <vector>
-#include <queue>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <atomic>
 #include <memory>
 #include <cstring>
 #include <cstdint>
 #include <unordered_map>
-#include <optional>
-#include <string_view>
+#include <span>
+#include <array>
+#include <algorithm>
+#include <csignal>
+#include <cerrno>
 
 // Linux Native System Headers
 #include <unistd.h>
 #include <fcntl.h>
+#include <string.h> // explicit_bzero
 #include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <csignal>
-#include <cerrno>
-#include <span>
-#include <expected>
 
+#include "net_util.hpp"
 #include "server_core.hpp"
 
-constexpr size_t MAX_EVENTS  = 64;
-constexpr int    SERVER_PORT = 8883;
+constexpr size_t   MAX_EVENTS  = 64;
+constexpr uint16_t SERVER_PORT = 8883;
 
-// ============================================================================
-// Runtime helpers and main
-// ============================================================================
-bool make_socket_non_blocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return false;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
-}
+// One accepted TCP connection. Declaration order matters: the writer is destroyed
+// before the descriptor it writes to is closed.
+struct Connection {
+    UniqueFd         fd;
+    AsyncWriteBuffer writer;
+    bool             warned_unauthenticated = false;
 
-std::expected<void, std::string> ensure_non_blocking(int fd) {
-    if (!make_socket_non_blocking(fd)) return std::unexpected("non-blocking failed");
-    return {};
-}
+    Connection(UniqueFd socket, int epoll_fd) : fd(std::move(socket)), writer(fd.get(), epoll_fd) {}
+};
 
 // Global stop flag reachable by signal handler
 std::atomic<bool> g_running{true};
 
-// Shutdown "doorbell": eventfd watched by epoll so the reactor can sleep with no timeout
+// Plain copy of the shutdown "doorbell" eventfd (owned by a UniqueFd in main) for the signal handler
 int g_wake_fd = -1;
 
 void signal_handler(int) {
@@ -66,11 +56,12 @@ void signal_handler(int) {
 
 int main() {
     // Create the shutdown eventfd before handlers can fire
-    g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (g_wake_fd == -1) {
-        std::cerr << "[CRITICAL] eventfd creation failed.\n";
+    auto wake = make_eventfd();
+    if (!wake) {
+        std::cerr << "[CRITICAL] " << wake.error() << "\n";
         return 1;
     }
+    g_wake_fd = wake->get();
 
     // Install graceful shutdown handlers
     std::signal(SIGINT,  signal_handler);
@@ -81,9 +72,23 @@ int main() {
     ignore_pipe.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &ignore_pipe, nullptr);
 
+    // Listener, epoll set and the eventfd registration; any failure is reported and fatal
+    auto setup_failed = [](const SysError& e) {
+        std::cerr << "[CRITICAL] Server setup failed on port " << SERVER_PORT << ": " << e << "\n";
+        return 1;
+    };
+    auto listener = create_listener(SERVER_PORT);
+    if (!listener) return setup_failed(listener.error());
+    auto epoll = make_epoll();
+    if (!epoll) return setup_failed(epoll.error());
+    const int server_fd = listener->get();
+    const int epoll_fd  = epoll->get();
+    if (auto added = epoll_add(epoll_fd, server_fd, EPOLLIN | EPOLLET); !added) return setup_failed(added.error());
+    if (auto added = epoll_add(epoll_fd, g_wake_fd, EPOLLIN); !added) return setup_failed(added.error());
+
     auto pipeline = std::make_shared<TelemetryPipeline>();
     ClientRegistry registry;
-    std::unordered_map<int, std::unique_ptr<AsyncWriteBuffer>> write_managers;
+    std::unordered_map<int, Connection> connections; // Owns every client socket
 
     // Calculate core processing footprints automatically
     unsigned int pool_size = std::thread::hardware_concurrency();
@@ -92,54 +97,24 @@ int main() {
 
     std::vector<std::jthread> workers;
     for (unsigned int i = 0; i < pool_size; ++i) {
-        std::jthread w([pipeline]() {
+        workers.emplace_back([pipeline]() {
             // Keep consuming until shutdown is requested and the queue is fully drained
             while (auto packet = pipeline->pop()) {
                 // Allocate workspace securely onto Heap inside the modern micro-stack framework
                 auto workspace = std::make_unique<LargeHeapWorkspace>();
-                
+
                 // --- DOMAIN PROCESSING BUSINESS LOGIC ---
                 std::cout << "[WORKER] Device: "
                           << (packet->validated_device_id.empty()
                                 ? "UNAUTHENTICATED"
                                 : packet->validated_device_id)
-                          << " (Length: " << packet->payload_len << " bytes)\n";
+                          << " (Length: " << packet->payload().size() << " bytes)\n";
             }
         });
-
-        workers.push_back(std::move(w));
     }
-
-    // Allocate Linux TCP socket configuration settings
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(SERVER_PORT);
-
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0 || listen(server_fd, SOMAXCONN) < 0 || !make_socket_non_blocking(server_fd)) {
-        std::cerr << "[CRITICAL] Infrastructure initialization sequence failed.\n";
-        pipeline->shutdown(); // Release workers so their jthreads can join
-        return 1;
-    }
-
-    int epoll_fd = epoll_create1(0);
-    epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET; 
-    ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
-
-    // Register the shutdown eventfd so a signal wakes the reactor instantly
-    epoll_event wake_ev{};
-    wake_ev.events = EPOLLIN;
-    wake_ev.data.fd = g_wake_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_wake_fd, &wake_ev);
 
     // Spare descriptor released on EMFILE so a pending connection can be accepted and closed
-    int spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    UniqueFd spare{open("/dev/null", O_RDONLY | O_CLOEXEC)};
 
     std::vector<epoll_event> events(MAX_EVENTS);
     std::cout << "[SERVER ENGINE] Monitoring port " << SERVER_PORT << " with Edge-Triggered Linux Epoll.\n";
@@ -166,19 +141,20 @@ int main() {
 
             if (current_fd == server_fd) {
                 while (true) { // Edge-Triggered loop: Drain all accept calls
-                    int client_fd = accept(server_fd, nullptr, nullptr);
-                    if (client_fd == -1) {
+                    UniqueFd client{accept4(server_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC)};
+                    if (!client) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         if (errno == EINTR || errno == ECONNABORTED) continue;
-                        if ((errno == EMFILE || errno == ENFILE) && spare_fd != -1) {
+                        if ((errno == EMFILE || errno == ENFILE) && spare) {
                             // Out of descriptors: free the spare, accept and close the pending connection,
                             // so it does not sit in the backlog with no further edge to wake us.
                             // (Linux reports EMFILE even when the backlog is empty, so stop on EAGAIN.)
-                            close(spare_fd);
-                            int rejected = accept(server_fd, nullptr, nullptr);
-                            if (rejected != -1) close(rejected);
-                            spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-                            if (rejected == -1) break;
+                            spare.reset();
+                            UniqueFd rejected{accept(server_fd, nullptr, nullptr)};
+                            const bool got_one = static_cast<bool>(rejected);
+                            rejected.reset();
+                            spare.reset(open("/dev/null", O_RDONLY | O_CLOEXEC));
+                            if (!got_one) break;
                             std::cerr << "[SERVER ENGINE] Out of file descriptors; rejected a connection.\n";
                             continue;
                         }
@@ -186,18 +162,19 @@ int main() {
                         break;
                     }
 
-                    if (make_socket_non_blocking(client_fd)) {
-                        epoll_event client_ev{};
-                        client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-                        client_ev.data.fd = client_fd;
-                        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
-                        write_managers[client_fd] = std::make_unique<AsyncWriteBuffer>(client_fd, epoll_fd);
-                    } else {
-                        close(client_fd);
+                    const int client_fd = client.get();
+                    if (auto added = epoll_add(epoll_fd, client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP); !added) {
+                        std::cerr << "[SERVER ENGINE] " << added.error() << "; dropping FD " << client_fd << "\n";
+                        continue; // UniqueFd closes the socket
                     }
+                    connections.try_emplace(client_fd, std::move(client), epoll_fd);
                 }
-            } 
+            }
             else {
+                auto conn_it = connections.find(current_fd);
+                if (conn_it == connections.end()) continue;
+                Connection& conn = conn_it->second;
+
                 // Read first: a peer that sends data and then closes delivers EPOLLIN together with
                 // EPOLLRDHUP/EPOLLHUP, and that final data must be drained before the socket is closed.
                 const uint32_t revents = events[i].events;
@@ -205,59 +182,69 @@ int main() {
                 bool disconnect = false;
 
                 if (revents & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-                    auto packet = std::make_unique<TelemetryPacket>();
+                    // Read into a reactor-owned stack buffer; heap packets are created only for real data
+                    std::array<uint8_t, MAX_PACKET_SIZE> buffer;
+                    size_t used = 0;
 
                     while (true) { // Edge-Triggered loop: Drain read socket completely
-                        ssize_t bytes_read = read(current_fd, packet->raw_payload, MAX_PACKET_SIZE);
+                        ssize_t bytes_read = read(current_fd, buffer.data(), buffer.size());
                         if (bytes_read > 0) {
-                            packet->payload_len = static_cast<size_t>(bytes_read);
-                            packet->file_descriptor = current_fd;
+                            const auto data = std::span<const uint8_t>(buffer).first(static_cast<size_t>(bytes_read));
+                            used = std::max(used, data.size());
 
-                            auto known_id = registry.get_device_id_by_fd(current_fd);
-                            if (!known_id.has_value()) {
-                                // Execute extraction against the raw payload to confirm identity bindings
-                                auto parsed_id = SafeMqttParser::extract_client_id(packet->raw_payload, packet->payload_len);
-                                if (parsed_id.has_value()) {
-                                    registry.register_client(parsed_id.value(), current_fd);
-                                    packet->validated_device_id = parsed_id.value();
-                                
-                                    // Securely route an validation acknowledgement response frame out to the client
-                                    if (write_managers.count(current_fd) &&
-                                        !write_managers[current_fd]->send_payload(MQTT_CONNACK_ACCEPTED.data(), MQTT_CONNACK_ACCEPTED.size())) {
-                                        std::cerr << "[SERVER ENGINE] CONNACK send failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
-                                        pipeline->push(std::move(packet)); // CONNECT already read; still hand it to the workers
-                                        disconnect = true; break;
-                                    }
+                            std::string device_id;
+                            if (auto known_id = registry.get_device_id_by_fd(current_fd)) {
+                                device_id = std::move(*known_id);
+                            } else if (auto parsed = SafeMqttParser::extract_client_id(data)) {
+                                device_id = std::string(*parsed); // Copy: the view points into `buffer`
+                                registry.register_client(device_id, current_fd);
+                                if (!conn.writer.send_payload(MQTT_CONNACK_ACCEPTED)) {
+                                    std::cerr << "[SERVER ENGINE] CONNACK send failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
+                                    disconnect = true; // CONNECT already read; still hand it to the workers below
+                                }
+                            } else if (parsed.error() == ConnectError::NotConnect) {
+                                // Raw data before any CONNECT: processed as UNAUTHENTICATED (logged once)
+                                if (!conn.warned_unauthenticated) {
+                                    std::cerr << "[SERVER ENGINE] FD " << current_fd << " sent data before a CONNECT; treating as UNAUTHENTICATED.\n";
+                                    conn.warned_unauthenticated = true;
                                 }
                             } else {
-                                packet->validated_device_id = known_id.value();
+                                // Malformed or refused CONNECT: tell the client why when MQTT has a code, then close
+                                std::cerr << "[SERVER ENGINE] Rejected CONNECT on FD " << current_fd << ": " << to_string(parsed.error()) << "\n";
+                                if (auto code = connack_code_for(parsed.error()))
+                                    (void)conn.writer.send_payload(make_connack(*code)); // Best effort: closing anyway
+                                disconnect = true; break;
                             }
 
+                            auto packet = std::make_unique_for_overwrite<TelemetryPacket>();
+                            packet->file_descriptor = current_fd;
+                            packet->validated_device_id = std::move(device_id);
+                            packet->payload_len = data.size();
+                            std::memcpy(packet->raw_payload, data.data(), data.size());
                             pipeline->push(std::move(packet));
-                            packet = std::make_unique<TelemetryPacket>(); // Reset RAII structural tracking instance
+                            if (disconnect) break;
                         } else if (bytes_read == 0) {
                             disconnect = true; break;
                         } else {
+                            if (errno == EINTR) continue;
                             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                             disconnect = true; break;
                         }
                     }
+                    explicit_bzero(buffer.data(), used); // Scrub the plaintext copy left on the stack
                 }
 
                 if (hangup) disconnect = true; // Peer closed or socket error: everything readable is drained
 
-                if (!disconnect && (revents & EPOLLOUT)) {
-                    if (write_managers.count(current_fd) && !write_managers[current_fd]->handle_write_ready()) {
-                        std::cerr << "[SERVER ENGINE] Write failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
-                        disconnect = true;
-                    }
+                if (!disconnect && (revents & EPOLLOUT) && !conn.writer.handle_write_ready()) {
+                    std::cerr << "[SERVER ENGINE] Write failed on FD " << current_fd << " (peer reset). Disconnecting.\n";
+                    disconnect = true;
                 }
 
                 if (disconnect) {
                     registry.remove_client_by_fd(current_fd);
-                    write_managers.erase(current_fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
-                    close(current_fd);
+                    connections.erase(conn_it); // Closes the socket
                 }
             }
         }
@@ -268,10 +255,8 @@ int main() {
     size_t pending = pipeline->shutdown();
     std::cout << "[SERVER ENGINE] Shutdown requested. Draining " << pending << " queued packet(s)...\n";
     workers.clear(); // jthreads join here once the queue is empty
-    close(server_fd);
-    close(epoll_fd);
-    close(g_wake_fd);
-    if (spare_fd != -1) close(spare_fd);
+    std::cout << "[SERVER ENGINE] Closing " << connections.size() << " client connection(s).\n";
+    connections.clear(); // UniqueFd closes every client socket; listener, epoll and eventfd close at scope exit
     std::cout << "[SERVER ENGINE] Shutdown complete.\n";
     return 0;
 }

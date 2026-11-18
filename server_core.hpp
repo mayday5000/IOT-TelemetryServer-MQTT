@@ -12,18 +12,26 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <cstdint>
 #include <cerrno>
 #include <unordered_map>
 #include <optional>
 #include <array>
+#include <span>
+#include <expected>
+#include <algorithm>
 
+#include <string.h> // explicit_bzero
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
-// MQTT CONNACK: packet type 0x20, remaining length 2, no session present, return code 0 (accepted)
-constexpr std::array<uint8_t, 4> MQTT_CONNACK_ACCEPTED = {0x20, 0x02, 0x00, 0x00};
+// MQTT CONNACK: packet type 0x20, remaining length 2, no session present, return code
+constexpr std::array<uint8_t, 4> make_connack(uint8_t return_code) { return {0x20, 0x02, 0x00, return_code}; }
+constexpr std::array<uint8_t, 4> MQTT_CONNACK_ACCEPTED = make_connack(0x00);
+constexpr uint8_t CONNACK_BAD_PROTOCOL = 0x01; // Unacceptable protocol version
+constexpr uint8_t CONNACK_ID_REJECTED  = 0x02; // Identifier rejected
 
 // ============================================================================
 // Data structures and RAII packet scrubbing
@@ -38,11 +46,14 @@ struct TelemetryPacket {
     uint8_t     raw_payload[MAX_PACKET_SIZE];
     size_t      payload_len;
 
-    // Secure RAII Scrubbing on destruction to explicitly wipe buffers from RAM
+    [[nodiscard]] std::span<const uint8_t> payload() const { return {raw_payload, payload_len}; }
+
+    // Secure RAII scrubbing on destruction. explicit_bzero, unlike memset, cannot be
+    // removed by the optimizer as a dead store just before the memory is freed.
     ~TelemetryPacket() {
         file_descriptor = -1;
         payload_len = 0;
-        std::memset(raw_payload, 0, MAX_PACKET_SIZE);
+        explicit_bzero(raw_payload, sizeof(raw_payload));
     }
 };
 
@@ -65,7 +76,7 @@ private:
     std::mutex registry_mutex_;
 
 public:
-    bool register_client(const std::string& device_id, int fd) {
+    void register_client(const std::string& device_id, int fd) {
         std::lock_guard<std::mutex> lock(registry_mutex_);
 
         // Evict structural ghost sessions on rapid socket re-registrations
@@ -79,10 +90,10 @@ public:
         id_map_[device_id] = client;
 
         std::cout << "[REGISTRY] Authenticated: Raw FD " << fd << " Bound to ID -> " << device_id << "\n";
-        return true; 
     }
 
-    std::optional<std::string> get_device_id_by_fd(int fd) {
+    // Returns a copy: a view into the map would dangle once the lock is released
+    [[nodiscard]] std::optional<std::string> get_device_id_by_fd(int fd) {
         std::lock_guard<std::mutex> lock(registry_mutex_);
         auto it = fd_map_.find(fd);
         if (it != fd_map_.end()) return it->second->device_id;
@@ -102,41 +113,72 @@ public:
 // ============================================================================
 // Bounds-checked MQTT CONNECT parser
 // ============================================================================
+enum class ConnectError : uint8_t {
+    TooShort,           // Empty buffer, or remaining length below the 12-byte minimum
+    NotConnect,         // First byte is not the CONNECT packet type (0x10)
+    BadRemainingLength, // Remaining-length field longer than 4 bytes
+    Truncated,          // Frame ends before the declared remaining length
+    BadProtocol,        // Protocol name is not "MQTT" or level is not 4 (3.1.1)
+    IdOverrun,          // Declared client-id length runs past the CONNECT payload
+    EmptyId             // Zero-length client id (this server does not assign ids)
+};
+
+constexpr std::string_view to_string(ConnectError e) {
+    switch (e) {
+        case ConnectError::TooShort:           return "frame too short";
+        case ConnectError::NotConnect:         return "not a CONNECT packet";
+        case ConnectError::BadRemainingLength: return "malformed remaining length";
+        case ConnectError::Truncated:          return "truncated CONNECT frame";
+        case ConnectError::BadProtocol:        return "unsupported protocol name or level";
+        case ConnectError::IdOverrun:          return "client id longer than the CONNECT payload";
+        case ConnectError::EmptyId:            return "empty client id";
+    }
+    return "unknown";
+}
+
+// CONNACK return code to send before closing, if MQTT defines one for this error
+constexpr std::optional<uint8_t> connack_code_for(ConnectError e) {
+    if (e == ConnectError::BadProtocol) return CONNACK_BAD_PROTOCOL;
+    if (e == ConnectError::EmptyId) return CONNACK_ID_REJECTED;
+    return std::nullopt;
+}
+
 class SafeMqttParser {
 public:
-    static std::optional<std::string> extract_client_id(const uint8_t* buffer, size_t length) {
-        if (length < 12) return std::nullopt;
-        if (buffer[0] != 0x10) return std::nullopt; // Verification check for MQTT CONNECT signature
+    // Returns a view into `buffer`: copy it before the buffer is reused
+    [[nodiscard]] static std::expected<std::string_view, ConnectError> extract_client_id(std::span<const uint8_t> buffer) {
+        if (buffer.empty()) return std::unexpected(ConnectError::TooShort);
+        if (buffer[0] != 0x10) return std::unexpected(ConnectError::NotConnect);
 
+        // Remaining length: 1 to 4 bytes, 7 bits each, high bit = continuation
         size_t index = 1;
         uint32_t remaining_length = 0;
-        uint32_t multiplier = 1;
-        
-        while (index < length) {
-            uint8_t byte = buffer[index++];
-            remaining_length += (byte & 127) * multiplier;
-            if (multiplier > 128 * 128 * 128) return std::nullopt; // Size guard filter
-            multiplier *= 128;
-            if ((byte & 128) == 0) break;
+        for (int i = 0;; ++i) {
+            if (i == 4) return std::unexpected(ConnectError::BadRemainingLength);
+            if (index >= buffer.size()) return std::unexpected(ConnectError::Truncated);
+            const uint8_t byte = buffer[index++];
+            remaining_length |= static_cast<uint32_t>(byte & 0x7F) << (7 * i);
+            if ((byte & 0x80) == 0) break;
         }
 
-        // Remaining payload must fit in the buffer and include the 10-byte variable
-        // header plus the 2-byte client-id length prefix (index + 10 was one byte short
-        // and could read buffer[index + 11] out of bounds).
-        if (remaining_length < 12 || index + remaining_length > length) return std::nullopt;
-        const size_t remaining_end = index + remaining_length;
-        index += 10; // Fast-forward past standard verification protocol blocks
+        // 10-byte variable header plus the 2-byte client-id length prefix
+        if (remaining_length < 12) return std::unexpected(ConnectError::TooShort);
+        if (remaining_length > buffer.size() - index) return std::unexpected(ConnectError::Truncated);
+        const auto body = buffer.subspan(index, remaining_length);
 
-        uint16_t id_len = (static_cast<uint16_t>(buffer[index]) << 8) | buffer[index + 1];
-        index += 2;
+        constexpr std::array<uint8_t, 7> kProtocol = {0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04};
+        if (!std::equal(kProtocol.begin(), kProtocol.end(), body.begin()))
+            return std::unexpected(ConnectError::BadProtocol);
 
-        if (index + id_len > remaining_end) return std::nullopt; // Structural string overrun check
-        return std::string(reinterpret_cast<const char*>(&buffer[index]), id_len);
+        const size_t id_len = (static_cast<size_t>(body[10]) << 8) | body[11];
+        if (id_len > body.size() - 12) return std::unexpected(ConnectError::IdOverrun);
+        if (id_len == 0) return std::unexpected(ConnectError::EmptyId);
+        return std::string_view(reinterpret_cast<const char*>(body.data() + 12), id_len);
     }
 };
 
 // ============================================================================
-// Non-blocking outbound write queue
+// Non-blocking outbound write queue (does not own the descriptors)
 // ============================================================================
 class AsyncWriteBuffer {
 private:
@@ -146,49 +188,45 @@ private:
     size_t pending_offset_ = 0;
     std::mutex write_mutex_;
 
-    void update_epoll_mask(bool enable_write) {
+    [[nodiscard]] bool update_epoll_mask(bool enable_write) {
         epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP; 
-        if (enable_write) ev.events |= EPOLLOUT; 
+        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+        if (enable_write) ev.events |= EPOLLOUT;
         ev.data.fd = file_descriptor_;
-        epoll_ctl(epoll_descriptor_, EPOLL_CTL_MOD, file_descriptor_, &ev);
+        return epoll_ctl(epoll_descriptor_, EPOLL_CTL_MOD, file_descriptor_, &ev) != -1;
     }
 
 public:
     AsyncWriteBuffer(int fd, int epoll_fd) : file_descriptor_(fd), epoll_descriptor_(epoll_fd) {}
 
     // Returns false on a hard socket error (EPIPE, ECONNRESET, ...): caller treats it as a disconnect
-    bool send_payload(const uint8_t* data, size_t length) {
+    [[nodiscard]] bool send_payload(std::span<const uint8_t> data) {
         std::lock_guard<std::mutex> lock(write_mutex_);
 
         if (!outbound_queue_.empty()) {
-            outbound_queue_.push(std::vector<uint8_t>(data, data + length));
+            outbound_queue_.emplace(data.begin(), data.end());
             return true;
         }
 
         ssize_t bytes_written;
         do { // MSG_NOSIGNAL: a reset peer yields EPIPE instead of a process-killing SIGPIPE
-            bytes_written = send(file_descriptor_, data, length, MSG_NOSIGNAL);
+            bytes_written = send(file_descriptor_, data.data(), data.size(), MSG_NOSIGNAL);
         } while (bytes_written == -1 && errno == EINTR);
         if (bytes_written >= 0) {
-            size_t written = static_cast<size_t>(bytes_written);
-            if (written < length) {
-                outbound_queue_.push(std::vector<uint8_t>(data + written, data + length));
-                pending_offset_ = 0;
-                update_epoll_mask(true);
-            }
+            const auto rest = data.subspan(static_cast<size_t>(bytes_written));
+            if (rest.empty()) return true;
+            outbound_queue_.emplace(rest.begin(), rest.end());
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            outbound_queue_.push(std::vector<uint8_t>(data, data + length));
-            pending_offset_ = 0;
-            update_epoll_mask(true);
+            outbound_queue_.emplace(data.begin(), data.end());
         } else {
             return false;
         }
-        return true;
+        pending_offset_ = 0;
+        return update_epoll_mask(true);
     }
 
     // Returns false on a hard socket error (EPIPE, ECONNRESET, ...)
-    bool handle_write_ready() {
+    [[nodiscard]] bool handle_write_ready() {
         std::lock_guard<std::mutex> lock(write_mutex_);
 
         while (!outbound_queue_.empty()) {
@@ -200,7 +238,7 @@ public:
                 size_t written = static_cast<size_t>(bytes_written);
                 if (written < bytes_left) {
                     pending_offset_ += written;
-                    return true; 
+                    return true;
                 } else {
                     outbound_queue_.pop();
                     pending_offset_ = 0;
@@ -213,8 +251,7 @@ public:
                 return false; // EPIPE / ECONNRESET: peer is gone
             }
         }
-        update_epoll_mask(false);
-        return true;
+        return update_epoll_mask(false);
     }
 };
 
@@ -235,12 +272,12 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         if (queue_.size() >= kCapacity) queue_.pop(); // Drop oldest element if memory bounds saturate
         queue_.push(std::move(packet));
-        cv_.notify_one(); 
+        cv_.notify_one();
     }
 
     // Returns queued packets until the queue is empty; nullptr only once shutdown
     // was requested AND every queued packet has been handed out (drain on exit).
-    std::unique_ptr<TelemetryPacket> pop() {
+    [[nodiscard]] std::unique_ptr<TelemetryPacket> pop() {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this]() { return !queue_.empty() || stop_requested_; });
         if (queue_.empty()) return nullptr;
